@@ -128,6 +128,27 @@ void applyEmitterPattern(SensorT &sensor, std::string const &mode,
   }
 }
 
+// Apply an auto-exposure ROI rectangle to the depth sensor. Wraps
+// rs2::roi_sensor::set_region_of_interest. Returns an empty string on
+// success, or an error description if the cast / call fails.
+template <typename SensorT, typename RoiSensorT = rs2::roi_sensor>
+std::string applyDepthAeRoi(SensorT &sensor, DepthAeRoi const &roi) {
+  if (not sensor.template is<RoiSensorT>()) {
+    return "sensor does not support auto-exposure ROI";
+  }
+  if (roi.min_x >= roi.max_x or roi.min_y >= roi.max_y) {
+    return "ROI must satisfy min_x < max_x and min_y < max_y";
+  }
+  try {
+    auto roi_sensor = sensor.template as<RoiSensorT>();
+    rs2::region_of_interest r{roi.min_x, roi.min_y, roi.max_x, roi.max_y};
+    roi_sensor.set_region_of_interest(r);
+  } catch (std::exception const &e) {
+    return e.what();
+  }
+  return {};
+}
+
 // Apply user-supplied depth sensor knobs (visual preset, laser power, emitter,
 // exposure, gain) before the pipeline starts. Each option is guarded by
 // supports(); unsupported ones are logged and skipped rather than aborting.
@@ -196,6 +217,24 @@ void applyDepthSensorOptions(SensorT &sensor, ViamConfigT const &viamConfig,
   }
   if (viamConfig.laser_power) {
     safe_set(RS2_OPTION_LASER_POWER, *viamConfig.laser_power, "laser_power");
+  }
+  // ROI requires rs2::roi_sensor — gated at compile time to avoid forcing
+  // mock sensor types in unit tests to implement the rs2 cast machinery.
+  if constexpr (std::is_same_v<SensorT, rs2::depth_sensor>) {
+    if (viamConfig.depth_ae_roi) {
+      auto err = applyDepthAeRoi(sensor, *viamConfig.depth_ae_roi);
+      if (not err.empty()) {
+        VIAM_DEVICE_LOG(logger, warn)
+            << "[applyDepthSensorOptions] depth_ae_roi: " << err;
+      } else {
+        VIAM_DEVICE_LOG(logger, info)
+            << "[applyDepthSensorOptions] set depth_ae_roi "
+            << viamConfig.depth_ae_roi->min_x << ","
+            << viamConfig.depth_ae_roi->min_y << " -> "
+            << viamConfig.depth_ae_roi->max_x << ","
+            << viamConfig.depth_ae_roi->max_y;
+      }
+    }
   }
 }
 

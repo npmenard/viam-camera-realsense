@@ -29,6 +29,16 @@ struct StreamConfig {
   int fps{0};
 };
 
+// Auto-exposure region-of-interest rectangle for the depth sensor. Pixel
+// coordinates inside the depth frame; AE adapts only to histogram inside
+// this box. Only meaningful when depth_auto_exposure is true.
+struct DepthAeRoi {
+  int min_x{0};
+  int min_y{0};
+  int max_x{0};
+  int max_y{0};
+};
+
 // Per-filter config blocks used by both RsResourceConfig (in realsense.hpp)
 // and DepthFilterChain. All sub-fields are optional — an unset sub-field
 // means the librealsense default value is used.

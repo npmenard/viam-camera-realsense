@@ -55,6 +55,7 @@ The following attributes are available for `viam:camera:realsense` cameras:
 | `depth_auto_exposure` | bool | Optional | Enables (`true`) or disables (`false`) auto-exposure on the depth sensor. If both `depth_auto_exposure` and `depth_exposure_us` are set, manual exposure wins and a warning is logged. |
 | `depth_gain` | number | Optional | Manual depth-sensor gain in the range `[0, 248]`. If omitted, the camera keeps its current gain. |
 | `emitter_pattern` | string | Optional | IR-projector mode: `"off"`, `"always_on"`, or `"alternate"` (emitter on every other frame). Superset of `depth_emitter_enabled`; when both are set, `emitter_pattern` wins and a warning is logged. |
+| `depth_ae_roi` | object | Optional | Restrict depth auto-exposure to a sub-rectangle of the frame: `{min_x: int, min_y: int, max_x: int, max_y: int}`. Only meaningful with `depth_auto_exposure: true`. Only D4xx variants that expose `rs2::roi_sensor` (the D435 / D435i / D415 all do) accept this; the helper logs a warning and skips otherwise. |
 | `decimation_filter` | object | Optional | Enables the `rs2::decimation_filter` post-processing step. Sub-fields: `magnitude` (int, 2..8). See the [Depth Post-Processing Filters](#depth-post-processing-filters) section. |
 | `depth_clip_distance` | object | Optional | Enables the `rs2::threshold_filter` to drop depth pixels outside `[min_m, max_m]` (both in metres, range `[0, 10]`). |
 | `spatial_filter` | object | Optional | Enables `rs2::spatial_filter`. Sub-fields: `magnitude` (int, 1..5), `smooth_alpha` (number, 0.25..1.0), `smooth_delta` (int, 1..50), `hole_fill` (int, 0..5). |
@@ -315,6 +316,8 @@ Each command takes exactly one key. The supported commands are:
 | `set_depth_auto_exposure` | bool | Enable/disable auto-exposure on the depth sensor. |
 | `set_depth_gain` | number | Manual gain, `[0, 248]`. |
 | `set_emitter_pattern` | string | `"off"`, `"always_on"`, or `"alternate"`. |
+| `set_depth_ae_roi` | `{min_x, min_y, max_x, max_y}` | Set the auto-exposure ROI rectangle on the depth sensor. |
+| `get_depth_ae_roi` | any | Read the current depth AE ROI (or report `supported: false` on cameras without `rs2::roi_sensor`). |
 | `get_depth_options` | any | Read back the current depth-sensor option values. |
 
 > [!NOTE]

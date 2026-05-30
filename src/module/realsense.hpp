@@ -71,6 +71,9 @@ enum class DoCommand : uint8_t {
   GET_STREAM_CONFIG, // no payload (any value) — returns active stream profiles
   // Emitter pattern: "off" | "always_on" | "alternate".
   SET_EMITTER_PATTERN,
+  // Depth auto-exposure ROI rectangle.
+  SET_DEPTH_AE_ROI,
+  GET_DEPTH_AE_ROI,
   UNKNOWN = std::numeric_limits<uint8_t>::max()
 };
 
@@ -115,6 +118,10 @@ static const std::unordered_map<std::string, uint8_t> DoCommandMap{
       static_cast<uint8_t>(DoCommand::GET_STREAM_CONFIG)},
      {"set_emitter_pattern",
       static_cast<uint8_t>(DoCommand::SET_EMITTER_PATTERN)},
+     {"set_depth_ae_roi",
+      static_cast<uint8_t>(DoCommand::SET_DEPTH_AE_ROI)},
+     {"get_depth_ae_roi",
+      static_cast<uint8_t>(DoCommand::GET_DEPTH_AE_ROI)},
      {"unknown", static_cast<uint8_t>(DoCommand::UNKNOWN)}}};
 
 const std::string service_name = "viam_realsense";
@@ -227,6 +234,10 @@ struct RsResourceConfig {
   // Depth emitter pattern. Overrides depth_emitter_enabled when both are
   // set. Valid values: "off" | "always_on" | "alternate".
   std::optional<std::string> emitter_pattern{};
+
+  // Auto-exposure ROI rectangle for the depth sensor. Only meaningful
+  // when depth_auto_exposure is true.
+  std::optional<device::DepthAeRoi> depth_ae_roi{};
 
   // Per-stream resolution / fps. When set, override the top-level
   // width/height fallback for that stream. Both unset → today's behaviour
@@ -941,6 +952,78 @@ public:
         r["frames_available"] = have_frameset;
         return r;
       }
+      case DoCommand::SET_DEPTH_AE_ROI: {
+        auto const &val = command.begin()->second;
+        if (not val.is_a<viam::sdk::ProtoStruct>()) {
+          viam::sdk::ProtoStruct r;
+          r["success"] = false;
+          r["error"] = "set_depth_ae_roi expects an object";
+          return r;
+        }
+        auto const &params = val.get_unchecked<viam::sdk::ProtoStruct>();
+        auto require_int = [&](char const *k) -> std::optional<int> {
+          auto it = params.find(k);
+          if (it == params.end()) return std::nullopt;
+          viam::sdk::ProtoValue const &pv = it->second;
+          if (not pv.is_a<double>()) return std::nullopt;
+          return static_cast<int>(pv.get_unchecked<double>());
+        };
+        auto min_x = require_int("min_x");
+        auto min_y = require_int("min_y");
+        auto max_x = require_int("max_x");
+        auto max_y = require_int("max_y");
+        if (not min_x or not min_y or not max_x or not max_y) {
+          viam::sdk::ProtoStruct r;
+          r["success"] = false;
+          r["error"] = "set_depth_ae_roi requires min_x, min_y, max_x, "
+                       "max_y (all numbers)";
+          return r;
+        }
+        device::DepthAeRoi roi{*min_x, *min_y, *max_x, *max_y};
+        viam::sdk::ProtoStruct response;
+        bool sensor_present =
+            withDepthSensor([&](rs2::depth_sensor &ds) {
+              auto err = device::applyDepthAeRoi(ds, roi);
+              if (err.empty()) {
+                response["success"] = true;
+                response["min_x"] = static_cast<double>(roi.min_x);
+                response["min_y"] = static_cast<double>(roi.min_y);
+                response["max_x"] = static_cast<double>(roi.max_x);
+                response["max_y"] = static_cast<double>(roi.max_y);
+              } else {
+                response["success"] = false;
+                response["error"] = err;
+              }
+            });
+        if (not sensor_present) {
+          response["success"] = false;
+          response["error"] = "no live depth sensor available";
+        }
+        return response;
+      }
+      case DoCommand::GET_DEPTH_AE_ROI: {
+        viam::sdk::ProtoStruct r;
+        bool sensor_present = withDepthSensor([&](rs2::depth_sensor &ds) {
+          if (not ds.is<rs2::roi_sensor>()) {
+            r["supported"] = false;
+            return;
+          }
+          try {
+            auto rs = ds.as<rs2::roi_sensor>();
+            auto roi = rs.get_region_of_interest();
+            r["supported"] = true;
+            r["min_x"] = static_cast<double>(roi.min_x);
+            r["min_y"] = static_cast<double>(roi.min_y);
+            r["max_x"] = static_cast<double>(roi.max_x);
+            r["max_y"] = static_cast<double>(roi.max_y);
+          } catch (std::exception const &e) {
+            r["supported"] = true;
+            r["error"] = std::string("read failed: ") + e.what();
+          }
+        });
+        r["sensor_present"] = sensor_present;
+        return r;
+      }
       case DoCommand::SET_EMITTER_PATTERN: {
         auto v = extractArg<std::string>(command, "set_emitter_pattern",
                                          "a string", err);
@@ -1584,6 +1667,47 @@ public:
       if (not device::isValidEmitterPattern(mode)) {
         throw std::invalid_argument(
             "emitter_pattern must be one of: off, always_on, alternate");
+      }
+    }
+
+    if (attrs.count("depth_ae_roi")) {
+      if (not attrs["depth_ae_roi"].is_a<viam::sdk::ProtoStruct>()) {
+        throw std::invalid_argument("depth_ae_roi must be an object");
+      }
+      auto const &sub =
+          attrs["depth_ae_roi"].get_unchecked<viam::sdk::ProtoStruct>();
+      for (auto const &[k, _] : sub) {
+        if (k != "min_x" and k != "min_y" and k != "max_x" and k != "max_y") {
+          throw std::invalid_argument(
+              std::string("depth_ae_roi: unknown key \"") + k + "\"");
+        }
+      }
+      int min_x = 0, min_y = 0, max_x = 0, max_y = 0;
+      for (auto const &k : {"min_x", "min_y", "max_x", "max_y"}) {
+        auto it = sub.find(k);
+        if (it == sub.end()) {
+          throw std::invalid_argument(std::string("depth_ae_roi.") + k +
+                                      " is required");
+        }
+        viam::sdk::ProtoValue const &pv = it->second;
+        if (not pv.is_a<double>()) {
+          throw std::invalid_argument(std::string("depth_ae_roi.") + k +
+                                      " must be a number");
+        }
+        double d = pv.get_unchecked<double>();
+        if (d < 0) {
+          throw std::invalid_argument(std::string("depth_ae_roi.") + k +
+                                      " must be >= 0");
+        }
+        int v = static_cast<int>(d);
+        if (std::string(k) == "min_x") min_x = v;
+        else if (std::string(k) == "min_y") min_y = v;
+        else if (std::string(k) == "max_x") max_x = v;
+        else if (std::string(k) == "max_y") max_y = v;
+      }
+      if (min_x >= max_x or min_y >= max_y) {
+        throw std::invalid_argument(
+            "depth_ae_roi: min_x < max_x and min_y < max_y required");
       }
     }
 
@@ -2283,6 +2407,15 @@ private:
     if (attrs.count("emitter_pattern")) {
       native_config.emitter_pattern =
           attrs["emitter_pattern"].get_unchecked<std::string>();
+    }
+    if (attrs.count("depth_ae_roi")) {
+      auto const &sub =
+          attrs["depth_ae_roi"].get_unchecked<viam::sdk::ProtoStruct>();
+      native_config.depth_ae_roi = device::DepthAeRoi{
+          static_cast<int>(sub.at("min_x").get_unchecked<double>()),
+          static_cast<int>(sub.at("min_y").get_unchecked<double>()),
+          static_cast<int>(sub.at("max_x").get_unchecked<double>()),
+          static_cast<int>(sub.at("max_y").get_unchecked<double>())};
     }
 
     if (attrs.count("color_auto_exposure")) {

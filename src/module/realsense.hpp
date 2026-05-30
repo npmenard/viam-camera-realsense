@@ -59,6 +59,12 @@ enum class DoCommand : uint8_t {
   SET_TEMPORAL_FILTER,
   SET_HOLE_FILLING_FILTER,
   GET_FILTER_OPTIONS, // no payload (any value) — returns current filter state
+  // Runtime color-sensor tuning.
+  SET_COLOR_AUTO_EXPOSURE,  // bool
+  SET_COLOR_EXPOSURE_US,    // number, microseconds
+  SET_COLOR_GAIN,           // number
+  SET_COLOR_WHITE_BALANCE,  // {auto?: bool, kelvin?: number}
+  GET_COLOR_OPTIONS,        // no payload (any value) — returns current values
   UNKNOWN = std::numeric_limits<uint8_t>::max()
 };
 
@@ -86,6 +92,15 @@ static const std::unordered_map<std::string, uint8_t> DoCommandMap{
       static_cast<uint8_t>(DoCommand::SET_HOLE_FILLING_FILTER)},
      {"get_filter_options",
       static_cast<uint8_t>(DoCommand::GET_FILTER_OPTIONS)},
+     {"set_color_auto_exposure",
+      static_cast<uint8_t>(DoCommand::SET_COLOR_AUTO_EXPOSURE)},
+     {"set_color_exposure_us",
+      static_cast<uint8_t>(DoCommand::SET_COLOR_EXPOSURE_US)},
+     {"set_color_gain", static_cast<uint8_t>(DoCommand::SET_COLOR_GAIN)},
+     {"set_color_white_balance",
+      static_cast<uint8_t>(DoCommand::SET_COLOR_WHITE_BALANCE)},
+     {"get_color_options",
+      static_cast<uint8_t>(DoCommand::GET_COLOR_OPTIONS)},
      {"unknown", static_cast<uint8_t>(DoCommand::UNKNOWN)}}};
 
 const std::string service_name = "viam_realsense";
@@ -194,6 +209,14 @@ struct RsResourceConfig {
   std::optional<double> depth_exposure_us{};
   std::optional<bool> depth_auto_exposure{};
   std::optional<double> depth_gain{};
+
+  // Color sensor tuning (all optional — unset leaves the camera's current
+  // factory/firmware default in place).
+  std::optional<bool> color_auto_exposure{};
+  std::optional<double> color_exposure_us{};
+  std::optional<double> color_gain{};
+  std::optional<bool> color_white_balance_auto{};
+  std::optional<double> color_white_balance_kelvin{};
 
   // Depth post-processing filter chain. All optional. Each block, when set,
   // enables that filter (applied in the Intel-recommended order); leaving
@@ -442,6 +465,60 @@ public:
     return true;
   }
 
+  // Same shape as withDepthSensor but for the color sensor. Holds the
+  // device lock only briefly to extract a copy of the sensor wrapper.
+  template <typename F> bool withColorSensor(F &&fn) {
+    if (not device_) {
+      return false;
+    }
+    std::optional<rs2::color_sensor> cs;
+    {
+      auto guard = device_->synchronize();
+      if (not guard->device) {
+        return false;
+      }
+      for (auto &s : guard->device->query_sensors()) {
+        if (s.template is<rs2::color_sensor>()) {
+          cs = s.template as<rs2::color_sensor>();
+          break;
+        }
+      }
+    }
+    if (not cs) {
+      return false;
+    }
+    fn(*cs);
+    return true;
+  }
+
+  // Apply a single rs2_option to the live color sensor and report status
+  // as a ProtoStruct response. Same shape as setDepthOption.
+  viam::sdk::ProtoStruct setColorOption(rs2_option opt, double value,
+                                         char const *name) {
+    viam::sdk::ProtoStruct response;
+    bool sensor_present = withColorSensor([&](rs2::color_sensor &cs) {
+      if (not cs.supports(opt)) {
+        response["success"] = false;
+        response["error"] = std::string("sensor does not support ") + name;
+        return;
+      }
+      try {
+        cs.set_option(opt, static_cast<float>(value));
+        response["success"] = true;
+        response["option"] = std::string(name);
+        response["value"] = value;
+      } catch (std::exception const &e) {
+        response["success"] = false;
+        response["error"] = std::string(e.what());
+      }
+    });
+    if (not sensor_present) {
+      response["success"] = false;
+      response["error"] = "no live color sensor available";
+    }
+    return response;
+  }
+
   // Apply a single rs2_option to the live depth sensor and report status as
   // a ProtoStruct response. Note: runtime overrides are not persisted across
   // a pipeline restart — the next reconfigure re-applies values from the
@@ -668,6 +745,93 @@ public:
         bool chain_present = withDepthFilterChain(
             [&](device::DepthFilterChain &c) { r = c.snapshot(); });
         r["chain_present"] = chain_present;
+        return r;
+      }
+      case DoCommand::SET_COLOR_AUTO_EXPOSURE: {
+        auto v = extractArg<bool>(command, "set_color_auto_exposure", "a bool",
+                                  err);
+        if (not v) return err;
+        return setColorOption(RS2_OPTION_ENABLE_AUTO_EXPOSURE,
+                              *v ? 1.0 : 0.0, "enable_auto_exposure");
+      }
+      case DoCommand::SET_COLOR_EXPOSURE_US: {
+        auto v = extractArg<double>(command, "set_color_exposure_us",
+                                    "a number", err);
+        if (not v) return err;
+        return setColorOption(RS2_OPTION_EXPOSURE, *v, "exposure_us");
+      }
+      case DoCommand::SET_COLOR_GAIN: {
+        auto v = extractArg<double>(command, "set_color_gain", "a number",
+                                    err);
+        if (not v) return err;
+        return setColorOption(RS2_OPTION_GAIN, *v, "gain");
+      }
+      case DoCommand::SET_COLOR_WHITE_BALANCE: {
+        auto const &val = command.begin()->second;
+        if (not val.is_a<viam::sdk::ProtoStruct>()) {
+          viam::sdk::ProtoStruct r;
+          r["success"] = false;
+          r["error"] = "set_color_white_balance expects an object";
+          return r;
+        }
+        auto const &params = val.get_unchecked<viam::sdk::ProtoStruct>();
+        // {auto?: bool, kelvin?: number}. Apply auto first because lib
+        // semantics: writing manual kelvin disables auto, so setting auto:
+        // true *after* kelvin would clobber the manual value.
+        auto it_auto = params.find("auto");
+        if (it_auto != params.end()) {
+          if (not it_auto->second.is_a<bool>()) {
+            viam::sdk::ProtoStruct r;
+            r["success"] = false;
+            r["error"] = "set_color_white_balance.auto must be a bool";
+            return r;
+          }
+          auto resp = setColorOption(
+              RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE,
+              it_auto->second.get_unchecked<bool>() ? 1.0 : 0.0,
+              "enable_auto_white_balance");
+          if (not resp["success"].template get_unchecked<bool>()) {
+            return resp;
+          }
+        }
+        auto it_k = params.find("kelvin");
+        if (it_k != params.end()) {
+          if (not it_k->second.is_a<double>()) {
+            viam::sdk::ProtoStruct r;
+            r["success"] = false;
+            r["error"] = "set_color_white_balance.kelvin must be a number";
+            return r;
+          }
+          return setColorOption(RS2_OPTION_WHITE_BALANCE,
+                                it_k->second.get_unchecked<double>(),
+                                "white_balance");
+        }
+        viam::sdk::ProtoStruct ok;
+        ok["success"] = true;
+        ok["option"] = std::string("white_balance");
+        return ok;
+      }
+      case DoCommand::GET_COLOR_OPTIONS: {
+        viam::sdk::ProtoStruct r;
+        bool sensor_present = withColorSensor([&](rs2::color_sensor &cs) {
+          auto safe_get = [&](rs2_option o, char const *k) {
+            if (not cs.supports(o)) {
+              return;
+            }
+            try {
+              r[k] = static_cast<double>(cs.get_option(o));
+            } catch (std::exception const &e) {
+              VIAM_RESOURCE_LOG(warn) << "[get_color_options] failed to read "
+                                      << k << ": " << e.what();
+            }
+          };
+          safe_get(RS2_OPTION_ENABLE_AUTO_EXPOSURE, "auto_exposure");
+          safe_get(RS2_OPTION_EXPOSURE, "exposure_us");
+          safe_get(RS2_OPTION_GAIN, "gain");
+          safe_get(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE, "white_balance_auto");
+          safe_get(RS2_OPTION_WHITE_BALANCE, "white_balance_kelvin");
+        });
+        r["sensor_present"] = sensor_present;
         return r;
       }
       default:
@@ -1252,6 +1416,49 @@ public:
       double g = attrs["depth_gain"].get_unchecked<double>();
       if (g < 0 or g > 248) {
         throw std::invalid_argument("depth_gain must be in [0, 248]");
+      }
+    }
+
+    // Color sensor tuning validation. Ranges chosen to match what the D435
+    // / D435i RGB sensor accepts; values outside these get rejected by
+    // librealsense at runtime anyway.
+    if (attrs.count("color_auto_exposure") and
+        not attrs["color_auto_exposure"].is_a<bool>()) {
+      throw std::invalid_argument("color_auto_exposure must be a bool");
+    }
+    if (attrs.count("color_exposure_us")) {
+      if (not attrs["color_exposure_us"].is_a<double>()) {
+        throw std::invalid_argument("color_exposure_us must be a number");
+      }
+      double e = attrs["color_exposure_us"].get_unchecked<double>();
+      if (e < 1 or e > 10000) {
+        throw std::invalid_argument(
+            "color_exposure_us must be in [1, 10000] (microseconds)");
+      }
+    }
+    if (attrs.count("color_gain")) {
+      if (not attrs["color_gain"].is_a<double>()) {
+        throw std::invalid_argument("color_gain must be a number");
+      }
+      double g = attrs["color_gain"].get_unchecked<double>();
+      if (g < 0 or g > 128) {
+        throw std::invalid_argument("color_gain must be in [0, 128]");
+      }
+    }
+    if (attrs.count("color_white_balance_auto") and
+        not attrs["color_white_balance_auto"].is_a<bool>()) {
+      throw std::invalid_argument("color_white_balance_auto must be a bool");
+    }
+    if (attrs.count("color_white_balance_kelvin")) {
+      if (not attrs["color_white_balance_kelvin"].is_a<double>()) {
+        throw std::invalid_argument(
+            "color_white_balance_kelvin must be a number");
+      }
+      double k =
+          attrs["color_white_balance_kelvin"].get_unchecked<double>();
+      if (k < 2800 or k > 6500) {
+        throw std::invalid_argument(
+            "color_white_balance_kelvin must be in [2800, 6500]");
       }
     }
 
@@ -1853,6 +2060,26 @@ private:
     }
     if (attrs.count("depth_gain")) {
       native_config.depth_gain = attrs["depth_gain"].get_unchecked<double>();
+    }
+
+    if (attrs.count("color_auto_exposure")) {
+      native_config.color_auto_exposure =
+          attrs["color_auto_exposure"].get_unchecked<bool>();
+    }
+    if (attrs.count("color_exposure_us")) {
+      native_config.color_exposure_us =
+          attrs["color_exposure_us"].get_unchecked<double>();
+    }
+    if (attrs.count("color_gain")) {
+      native_config.color_gain = attrs["color_gain"].get_unchecked<double>();
+    }
+    if (attrs.count("color_white_balance_auto")) {
+      native_config.color_white_balance_auto =
+          attrs["color_white_balance_auto"].get_unchecked<bool>();
+    }
+    if (attrs.count("color_white_balance_kelvin")) {
+      native_config.color_white_balance_kelvin =
+          attrs["color_white_balance_kelvin"].get_unchecked<double>();
     }
 
     parseFilterBlocks(attrs, native_config);

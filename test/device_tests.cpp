@@ -1417,6 +1417,134 @@ TEST_F(DeviceTest, DepthFilterChain_UpdateRejectsWrongType) {
                std::invalid_argument);
 }
 
+// ---------------------------------------------------------------------------
+// applyColorSensorOptions tests — mirrors the existing applyDepthSensorOptions
+// pattern: each opt-in knob triggers a single supports/set_option pair.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Minimal config carrier with just the color knobs the helper reads.
+struct ColorCfg {
+  std::optional<bool> color_auto_exposure{};
+  std::optional<double> color_exposure_us{};
+  std::optional<double> color_gain{};
+  std::optional<bool> color_white_balance_auto{};
+  std::optional<double> color_white_balance_kelvin{};
+};
+} // namespace
+
+TEST_F(DeviceTest, ApplyColorSensorOptions_NoOptsSet_TouchesNothing) {
+  test_utils::LogCaptureFixture log_capture;
+  viam::sdk::LogSource logger;
+  SimpleSensor color_sensor;
+  color_sensor.set_sensor_type(true, false);
+
+  EXPECT_CALL(*color_sensor.mock(), supports(_)).Times(0);
+  EXPECT_CALL(*color_sensor.mock(), set_option(_, _)).Times(0);
+
+  applyColorSensorOptions(color_sensor, ColorCfg{}, logger);
+}
+
+TEST_F(DeviceTest, ApplyColorSensorOptions_AppliesEachOptInKnob) {
+  test_utils::LogCaptureFixture log_capture;
+  viam::sdk::LogSource logger;
+  SimpleSensor color_sensor;
+  color_sensor.set_sensor_type(true, false);
+
+  ColorCfg cfg;
+  cfg.color_auto_exposure = false;
+  cfg.color_exposure_us = 1200.0;
+  cfg.color_gain = 32.0;
+  cfg.color_white_balance_auto = false;
+  cfg.color_white_balance_kelvin = 3500.0;
+
+  EXPECT_CALL(*color_sensor.mock(), supports(RS2_OPTION_ENABLE_AUTO_EXPOSURE))
+      .Times(1)
+      .WillOnce(Return(true));
+  EXPECT_CALL(*color_sensor.mock(),
+              set_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, 0.0f))
+      .Times(1);
+  EXPECT_CALL(*color_sensor.mock(), supports(RS2_OPTION_EXPOSURE))
+      .Times(1)
+      .WillOnce(Return(true));
+  EXPECT_CALL(*color_sensor.mock(), set_option(RS2_OPTION_EXPOSURE, 1200.0f))
+      .Times(1);
+  EXPECT_CALL(*color_sensor.mock(), supports(RS2_OPTION_GAIN))
+      .Times(1)
+      .WillOnce(Return(true));
+  EXPECT_CALL(*color_sensor.mock(), set_option(RS2_OPTION_GAIN, 32.0f))
+      .Times(1);
+  EXPECT_CALL(*color_sensor.mock(),
+              supports(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE))
+      .Times(1)
+      .WillOnce(Return(true));
+  EXPECT_CALL(*color_sensor.mock(),
+              set_option(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE, 0.0f))
+      .Times(1);
+  EXPECT_CALL(*color_sensor.mock(), supports(RS2_OPTION_WHITE_BALANCE))
+      .Times(1)
+      .WillOnce(Return(true));
+  EXPECT_CALL(*color_sensor.mock(),
+              set_option(RS2_OPTION_WHITE_BALANCE, 3500.0f))
+      .Times(1);
+
+  applyColorSensorOptions(color_sensor, cfg, logger);
+}
+
+TEST_F(DeviceTest, ApplyColorSensorOptions_UnsupportedOption_LogsAndSkips) {
+  test_utils::LogCaptureFixture log_capture;
+  viam::sdk::LogSource logger;
+  SimpleSensor color_sensor;
+  color_sensor.set_sensor_type(true, false);
+
+  ColorCfg cfg;
+  cfg.color_gain = 64.0;
+
+  EXPECT_CALL(*color_sensor.mock(), supports(RS2_OPTION_GAIN))
+      .Times(1)
+      .WillOnce(Return(false));
+  EXPECT_CALL(*color_sensor.mock(), set_option(_, _)).Times(0);
+
+  applyColorSensorOptions(color_sensor, cfg, logger);
+
+  auto logs = log_capture.get_records();
+  bool found_warn = false;
+  for (auto const &log : logs) {
+    if (log.message.find("does not support gain") != std::string::npos) {
+      found_warn = true;
+    }
+  }
+  EXPECT_TRUE(found_warn) << "Should log a warning for unsupported gain";
+}
+
+TEST_F(DeviceTest,
+       ApplyColorSensorOptions_AeAndManualExposureBothSet_LogsWarning) {
+  test_utils::LogCaptureFixture log_capture;
+  viam::sdk::LogSource logger;
+  SimpleSensor color_sensor;
+  color_sensor.set_sensor_type(true, false);
+
+  ColorCfg cfg;
+  cfg.color_auto_exposure = true;
+  cfg.color_exposure_us = 1000.0;
+
+  EXPECT_CALL(*color_sensor.mock(), supports(_))
+      .WillRepeatedly(Return(true));
+  EXPECT_CALL(*color_sensor.mock(), set_option(_, _)).Times(2);
+
+  applyColorSensorOptions(color_sensor, cfg, logger);
+
+  auto logs = log_capture.get_records();
+  bool found_warn = false;
+  for (auto const &log : logs) {
+    if (log.message.find("manual exposure will override") !=
+        std::string::npos) {
+      found_warn = true;
+    }
+  }
+  EXPECT_TRUE(found_warn) << "Should warn about AE+manual exposure conflict";
+}
+
 } // namespace test
 } // namespace device
 } // namespace realsense

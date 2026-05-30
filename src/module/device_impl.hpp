@@ -141,6 +141,62 @@ void applyDepthSensorOptions(SensorT &sensor, ViamConfigT const &viamConfig,
   }
 }
 
+// Apply user-supplied color sensor knobs (auto-exposure, manual exposure,
+// gain, white balance) before the pipeline starts. Same opt-in pattern as
+// applyDepthSensorOptions: each value is std::optional on the config; unset
+// fields leave the camera at its factory default. Independent from the
+// existing disableAutoExposurePriority, which controls AUTO_EXPOSURE_PRIORITY
+// (frame-sync) — the user's color_auto_exposure controls ENABLE_AUTO_EXPOSURE
+// (AE itself). Both can coexist.
+template <typename SensorT, typename ViamConfigT>
+void applyColorSensorOptions(SensorT &sensor, ViamConfigT const &viamConfig,
+                             viam::sdk::LogSource &logger) {
+  auto safe_set = [&](rs2_option opt, double value, char const *name) {
+    if (not sensor.supports(opt)) {
+      VIAM_DEVICE_LOG(logger, warn)
+          << "[applyColorSensorOptions] sensor does not support " << name;
+      return;
+    }
+    try {
+      sensor.set_option(opt, static_cast<float>(value));
+      VIAM_DEVICE_LOG(logger, info)
+          << "[applyColorSensorOptions] set " << name << "=" << value;
+    } catch (std::exception const &e) {
+      VIAM_DEVICE_LOG(logger, error)
+          << "[applyColorSensorOptions] failed to set " << name << ": "
+          << e.what();
+    }
+  };
+
+  if (viamConfig.color_auto_exposure and viamConfig.color_exposure_us) {
+    VIAM_DEVICE_LOG(logger, warn)
+        << "[applyColorSensorOptions] both color_auto_exposure and "
+           "color_exposure_us are set; manual exposure will override "
+           "auto-exposure";
+  }
+  if (viamConfig.color_auto_exposure) {
+    safe_set(RS2_OPTION_ENABLE_AUTO_EXPOSURE,
+             *viamConfig.color_auto_exposure ? 1.0 : 0.0,
+             "enable_auto_exposure");
+  }
+  if (viamConfig.color_exposure_us) {
+    safe_set(RS2_OPTION_EXPOSURE, *viamConfig.color_exposure_us,
+             "exposure_us");
+  }
+  if (viamConfig.color_gain) {
+    safe_set(RS2_OPTION_GAIN, *viamConfig.color_gain, "gain");
+  }
+  if (viamConfig.color_white_balance_auto) {
+    safe_set(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE,
+             *viamConfig.color_white_balance_auto ? 1.0 : 0.0,
+             "enable_auto_white_balance");
+  }
+  if (viamConfig.color_white_balance_kelvin) {
+    safe_set(RS2_OPTION_WHITE_BALANCE,
+             *viamConfig.color_white_balance_kelvin, "white_balance");
+  }
+}
+
 template <typename SensorT>
 void disableAutoExposurePriority(SensorT &sensor,
                                  viam::sdk::LogSource &logger) {
@@ -432,9 +488,11 @@ createSingleSensorConfig(std::shared_ptr<DeviceT> dev,
     if (s.template is<SensorT>()) {
       sensor = s;
       enableGlobalTimestamp(sensor, logger);
-      // depth-sensor-only single-stream path
       if (s.template is<rs2::depth_sensor>()) {
         applyDepthSensorOptions(sensor, viamConfig, logger);
+      }
+      if (s.template is<rs2::color_sensor>()) {
+        applyColorSensorOptions(sensor, viamConfig, logger);
       }
     }
   }
@@ -489,6 +547,7 @@ std::shared_ptr<ConfigT> createSwD2CAlignConfig(std::shared_ptr<DeviceT> dev,
     if (s.template is<ColorSensorT>()) {
       color_sensor = s;
       disableAutoExposurePriority(color_sensor, logger);
+      applyColorSensorOptions(color_sensor, viamConfig, logger);
     }
     if (s.template is<DepthSensorT>()) {
       depth_sensor = s;

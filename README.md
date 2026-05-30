@@ -59,6 +59,11 @@ The following attributes are available for `viam:camera:realsense` cameras:
 | `spatial_filter` | object | Optional | Enables `rs2::spatial_filter`. Sub-fields: `magnitude` (int, 1..5), `smooth_alpha` (number, 0.25..1.0), `smooth_delta` (int, 1..50), `hole_fill` (int, 0..5). |
 | `temporal_filter` | object | Optional | Enables `rs2::temporal_filter`. Sub-fields: `smooth_alpha` (number, 0..1), `smooth_delta` (int, 1..100), `persistence` (int, 0..8). |
 | `hole_filling_filter` | object | Optional | Enables `rs2::hole_filling_filter`. Sub-fields: `mode` (int, 0=fill-from-left, 1=farthest-around, 2=nearest-around). See the caveat in the [Depth Post-Processing Filters](#depth-post-processing-filters) section before enabling. |
+| `color_auto_exposure` | bool | Optional | Enables (`true`) or disables (`false`) auto-exposure on the color stream. Independent from the always-on auto-exposure-priority disable (see the [Color Sensor Controls](#color-sensor-controls) section). |
+| `color_exposure_us` | number | Optional | Manual color-sensor exposure in microseconds, range `[1, 10000]`. Setting this implicitly disables color AE in librealsense. |
+| `color_gain` | number | Optional | Manual color-sensor gain, range `[0, 128]`. |
+| `color_white_balance_auto` | bool | Optional | Enables (`true`) or disables (`false`) auto white balance. |
+| `color_white_balance_kelvin` | number | Optional | Manual white-balance colour temperature in kelvin, range `[2800, 6500]`. Setting this implicitly disables auto-WB. |
 
 ## Example configuration:
 
@@ -392,6 +397,52 @@ await camera.do_command({"get_filter_options": ""})
 - It applies after `temporal_filter` in the recommended order; filled pixels jitter frame-to-frame independently of the temporally-smoothed valid pixels.
 
 Use it only when the downstream consumer wants a dense image regardless of accuracy (visualisation, or a neural net trained on filled depth). For anything quantitative, prefer to leave it off.
+
+### Color Sensor Controls
+
+Optional knobs on the RGB stream. **All opt-in** — omitting every attribute below leaves the colour sensor at its factory defaults, identical to pre-PR behaviour.
+
+#### Configuration
+
+```json
+{
+  "color_auto_exposure":        false,
+  "color_exposure_us":          1200,
+  "color_gain":                 32,
+  "color_white_balance_auto":   false,
+  "color_white_balance_kelvin": 3500
+}
+```
+
+#### Runtime `do_command` keys
+
+| Command | Value | Description |
+| ------- | ----- | ----------- |
+| `set_color_auto_exposure` | bool | Toggle AE on the RGB stream. |
+| `set_color_exposure_us` | number | Set manual exposure in microseconds. Lib will disable AE implicitly. |
+| `set_color_gain` | number | Set manual gain. |
+| `set_color_white_balance` | `{auto?: bool, kelvin?: number}` | Toggle auto-WB and/or set manual kelvin. `auto` is applied first so a kelvin in the same call wins. |
+| `get_color_options` | any | Return the current colour-sensor option values. |
+
+> [!NOTE]
+> Auto-exposure (`color_auto_exposure`) is **not** the same as the auto-exposure *priority* the module always disables for frame-sync. AE priority lets the sensor drop frames to expose; the module keeps that off so depth and colour stay temporally aligned. AE itself (whether the sensor *adjusts* exposure to scene brightness) is what `color_auto_exposure` controls. Both can coexist.
+
+> [!NOTE]
+> Runtime `set_color_*` calls are **not persisted**: the next reconfigure (or pipeline restart) re-applies values from the resource config. To persist, also set the matching attribute.
+
+#### Example using Python SDK
+
+```python
+# Manual exposure for stable Otsu features under changing room lighting
+await camera.do_command({"set_color_auto_exposure": False})
+await camera.do_command({"set_color_exposure_us": 1200})
+
+# Lock white balance to a warm room
+await camera.do_command({"set_color_white_balance": {"auto": False, "kelvin": 3500}})
+
+# Read back current state
+await camera.do_command({"get_color_options": ""})
+```
 
 ### Locally install the module
 

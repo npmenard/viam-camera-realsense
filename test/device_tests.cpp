@@ -1517,6 +1517,20 @@ TEST_F(DeviceTest, ApplyColorSensorOptions_UnsupportedOption_LogsAndSkips) {
   EXPECT_TRUE(found_warn) << "Should log a warning for unsupported gain";
 }
 
+TEST_F(DeviceTest, StreamConfig_DefaultConstructedIsZeroed) {
+  StreamConfig sc{};
+  EXPECT_EQ(sc.width_px, 0);
+  EXPECT_EQ(sc.height_px, 0);
+  EXPECT_EQ(sc.fps, 0);
+}
+
+TEST_F(DeviceTest, StreamConfig_FieldInitialization) {
+  StreamConfig sc{848, 480, 30};
+  EXPECT_EQ(sc.width_px, 848);
+  EXPECT_EQ(sc.height_px, 480);
+  EXPECT_EQ(sc.fps, 30);
+}
+
 TEST_F(DeviceTest,
        ApplyColorSensorOptions_AeAndManualExposureBothSet_LogsWarning) {
   test_utils::LogCaptureFixture log_capture;

@@ -512,9 +512,28 @@ createSingleSensorConfig(std::shared_ptr<DeviceT> dev,
       continue;
     }
 
-    if ((not viamConfig.width) or
-        (viamConfig.width == csp.width()) and
-            (not viamConfig.height or (viamConfig.height == csp.height()))) {
+    // Per-stream block wins when set; otherwise fall back to top-level
+    // width/height (today's behaviour). fps falls back to "accept any" when
+    // no per-stream fps is set. SensorT identifies which stream this is.
+    std::optional<int> effective_w = viamConfig.width;
+    std::optional<int> effective_h = viamConfig.height;
+    std::optional<int> effective_fps;
+    if constexpr (std::is_same_v<SensorT, rs2::depth_sensor>) {
+      if (viamConfig.depth_stream) {
+        effective_w = viamConfig.depth_stream->width_px;
+        effective_h = viamConfig.depth_stream->height_px;
+        effective_fps = viamConfig.depth_stream->fps;
+      }
+    } else if constexpr (std::is_same_v<SensorT, rs2::color_sensor>) {
+      if (viamConfig.color_stream) {
+        effective_w = viamConfig.color_stream->width_px;
+        effective_h = viamConfig.color_stream->height_px;
+        effective_fps = viamConfig.color_stream->fps;
+      }
+    }
+    if ((not effective_w or *effective_w == csp.width()) and
+        (not effective_h or *effective_h == csp.height()) and
+        (not effective_fps or *effective_fps == csp.fps())) {
       VIAM_DEVICE_LOG(logger, info)
           << "[createSingleSensorConfig] Found matching "
              "stream profile, enabling";
@@ -559,10 +578,46 @@ std::shared_ptr<ConfigT> createSwD2CAlignConfig(std::shared_ptr<DeviceT> dev,
   auto color_profiles = color_sensor.get_stream_profiles();
   auto depth_profiles = depth_sensor.get_stream_profiles();
 
+  // Per-stream resolution / fps: a depth_stream/color_stream block on the
+  // config wins over the top-level width/height. fps is "accept any" unless
+  // a per-stream block specifies it.
+  auto color_w = viamConfig.color_stream
+                     ? std::optional<int>{viamConfig.color_stream->width_px}
+                     : viamConfig.width;
+  auto color_h = viamConfig.color_stream
+                     ? std::optional<int>{viamConfig.color_stream->height_px}
+                     : viamConfig.height;
+  std::optional<int> color_fps =
+      viamConfig.color_stream
+          ? std::optional<int>{viamConfig.color_stream->fps}
+          : std::nullopt;
+  auto depth_w = viamConfig.depth_stream
+                     ? std::optional<int>{viamConfig.depth_stream->width_px}
+                     : viamConfig.width;
+  auto depth_h = viamConfig.depth_stream
+                     ? std::optional<int>{viamConfig.depth_stream->height_px}
+                     : viamConfig.height;
+  std::optional<int> depth_fps =
+      viamConfig.depth_stream
+          ? std::optional<int>{viamConfig.depth_stream->fps}
+          : std::nullopt;
+
+  // When per-stream blocks are set independently, the color and depth
+  // resolutions can differ; rs2::align resamples to the color frame, so
+  // mismatched sizes are fine. We only require the same constraint as
+  // before when neither block is set: matching color/depth resolutions.
+  bool require_matched =
+      not viamConfig.color_stream and not viamConfig.depth_stream;
+
   // Find matching profiles
   for (auto &cp : color_profiles) {
     auto csp = cp.template as<VideoStreamProfileT>();
     if (csp.format() != SensorTypeTraits<ColorSensorT>::format_type) {
+      continue;
+    }
+    if ((color_w and *color_w != csp.width()) or
+        (color_h and *color_h != csp.height()) or
+        (color_fps and *color_fps != csp.fps())) {
       continue;
     }
     for (auto &dp : depth_profiles) {
@@ -570,22 +625,30 @@ std::shared_ptr<ConfigT> createSwD2CAlignConfig(std::shared_ptr<DeviceT> dev,
       if (dsp.format() != SensorTypeTraits<DepthSensorT>::format_type) {
         continue;
       }
-      if (checkIfMatchingColorDepthProfiles(csp, dsp, logger) and
-          ((not viamConfig.width) or (viamConfig.width == csp.width())) and
-          ((not viamConfig.height) or (viamConfig.height == csp.height()))) {
-        VIAM_DEVICE_LOG(logger, info)
-            << "[createSwD2CAlignConfig] Found matching color "
-               "and depth stream profiles";
-        cfg->enable_stream(SensorTypeTraits<ColorSensorT>::stream_type,
-                           csp.stream_index(), csp.width(), csp.height(),
-                           csp.format(), csp.fps());
-        cfg->enable_stream(SensorTypeTraits<DepthSensorT>::stream_type,
-                           dsp.stream_index(), dsp.width(), dsp.height(),
-                           dsp.format(), dsp.fps());
-        VIAM_DEVICE_LOG(logger, info)
-            << "[createSwD2CAlignConfig] enabled color and depth streams";
-        return cfg;
+      if ((depth_w and *depth_w != dsp.width()) or
+          (depth_h and *depth_h != dsp.height()) or
+          (depth_fps and *depth_fps != dsp.fps())) {
+        continue;
       }
+      if (require_matched and
+          not checkIfMatchingColorDepthProfiles(csp, dsp, logger)) {
+        continue;
+      }
+      VIAM_DEVICE_LOG(logger, info)
+          << "[createSwD2CAlignConfig] Found matching color and depth "
+             "stream profiles: color "
+          << csp.width() << "x" << csp.height() << "@" << csp.fps()
+          << " depth " << dsp.width() << "x" << dsp.height() << "@"
+          << dsp.fps();
+      cfg->enable_stream(SensorTypeTraits<ColorSensorT>::stream_type,
+                         csp.stream_index(), csp.width(), csp.height(),
+                         csp.format(), csp.fps());
+      cfg->enable_stream(SensorTypeTraits<DepthSensorT>::stream_type,
+                         dsp.stream_index(), dsp.width(), dsp.height(),
+                         dsp.format(), dsp.fps());
+      VIAM_DEVICE_LOG(logger, info)
+          << "[createSwD2CAlignConfig] enabled color and depth streams";
+      return cfg;
     }
   }
   return nullptr;

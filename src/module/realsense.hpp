@@ -65,6 +65,10 @@ enum class DoCommand : uint8_t {
   SET_COLOR_GAIN,           // number
   SET_COLOR_WHITE_BALANCE,  // {auto?: bool, kelvin?: number}
   GET_COLOR_OPTIONS,        // no payload (any value) — returns current values
+  // Per-stream resolution / fps. Set commands restart the pipeline.
+  SET_DEPTH_STREAM, // {width_px, height_px, fps}
+  SET_COLOR_STREAM, // {width_px, height_px, fps}
+  GET_STREAM_CONFIG, // no payload (any value) — returns active stream profiles
   UNKNOWN = std::numeric_limits<uint8_t>::max()
 };
 
@@ -101,6 +105,12 @@ static const std::unordered_map<std::string, uint8_t> DoCommandMap{
       static_cast<uint8_t>(DoCommand::SET_COLOR_WHITE_BALANCE)},
      {"get_color_options",
       static_cast<uint8_t>(DoCommand::GET_COLOR_OPTIONS)},
+     {"set_depth_stream",
+      static_cast<uint8_t>(DoCommand::SET_DEPTH_STREAM)},
+     {"set_color_stream",
+      static_cast<uint8_t>(DoCommand::SET_COLOR_STREAM)},
+     {"get_stream_config",
+      static_cast<uint8_t>(DoCommand::GET_STREAM_CONFIG)},
      {"unknown", static_cast<uint8_t>(DoCommand::UNKNOWN)}}};
 
 const std::string service_name = "viam_realsense";
@@ -209,6 +219,12 @@ struct RsResourceConfig {
   std::optional<double> depth_exposure_us{};
   std::optional<bool> depth_auto_exposure{};
   std::optional<double> depth_gain{};
+
+  // Per-stream resolution / fps. When set, override the top-level
+  // width/height fallback for that stream. Both unset → today's behaviour
+  // (top-level width/height applies to both streams).
+  std::optional<device::StreamConfig> depth_stream{};
+  std::optional<device::StreamConfig> color_stream{};
 
   // Color sensor tuning (all optional — unset leaves the camera's current
   // factory/firmware default in place).
@@ -463,6 +479,31 @@ public:
     }
     fn(*ds);
     return true;
+  }
+
+  // Stop the pipe (if running), rebuild the rs2::config from the current
+  // in-memory RsResourceConfig, and start the pipe. Used by the runtime
+  // set_*_stream handlers to honour a new per-stream resolution without
+  // going through a full Reconfigurable::reconfigure() (no ResourceConfig
+  // in scope). Recovery-safe: if the device is already stopped (e.g.
+  // because a previous attempt failed at startDevice), the stop step is
+  // skipped instead of erroring. Throws on reconfigure/start failure.
+  void restartPipelineFromCurrentConfig() {
+    bool was_started = false;
+    if (device_) {
+      auto guard = device_->synchronize();
+      was_started = guard->started;
+    }
+    if (was_started) {
+      if (not device_funcs_.stopDevice(device_, this->logger_)) {
+        throw std::runtime_error("failed to stop device");
+      }
+    }
+    realsense::RsResourceConfig config_copy = config_.get();
+    device_funcs_.reconfigureDevice(device_, config_copy, this->logger_);
+    device_funcs_.startDevice(config_copy.serial_number, device_,
+                              latest_frameset_, MAX_FRAME_AGE_MS, config_copy,
+                              this->logger_);
   }
 
   // Same shape as withDepthSensor but for the color sensor. Holds the
@@ -810,6 +851,87 @@ public:
         ok["success"] = true;
         ok["option"] = std::string("white_balance");
         return ok;
+      }
+      case DoCommand::SET_DEPTH_STREAM:
+      case DoCommand::SET_COLOR_STREAM: {
+        auto const &cmd_name = command.begin()->first;
+        auto const &val = command.begin()->second;
+        if (not val.is_a<viam::sdk::ProtoStruct>()) {
+          viam::sdk::ProtoStruct r;
+          r["success"] = false;
+          r["error"] = cmd_name + " expects an object";
+          return r;
+        }
+        auto const &params = val.get_unchecked<viam::sdk::ProtoStruct>();
+        auto require_int = [&](char const *k) -> std::optional<int> {
+          auto it = params.find(k);
+          if (it == params.end() or not it->second.is_a<double>()) {
+            return std::nullopt;
+          }
+          return static_cast<int>(it->second.get_unchecked<double>());
+        };
+        auto w = require_int("width_px");
+        auto h = require_int("height_px");
+        auto fps = require_int("fps");
+        if (not w or not h or not fps) {
+          viam::sdk::ProtoStruct r;
+          r["success"] = false;
+          r["error"] = cmd_name +
+              " requires width_px (number), height_px (number), fps (number)";
+          return r;
+        }
+        device::StreamConfig new_stream{*w, *h, *fps};
+        {
+          auto guard = config_.synchronize();
+          if (do_command == DoCommand::SET_DEPTH_STREAM) {
+            guard->depth_stream = new_stream;
+          } else {
+            guard->color_stream = new_stream;
+          }
+        }
+        try {
+          restartPipelineFromCurrentConfig();
+        } catch (std::exception const &e) {
+          viam::sdk::ProtoStruct r;
+          r["success"] = false;
+          r["error"] = std::string("pipeline restart failed: ") + e.what();
+          return r;
+        }
+        viam::sdk::ProtoStruct ok;
+        ok["success"] = true;
+        ok["width_px"] = static_cast<double>(*w);
+        ok["height_px"] = static_cast<double>(*h);
+        ok["fps"] = static_cast<double>(*fps);
+        return ok;
+      }
+      case DoCommand::GET_STREAM_CONFIG: {
+        viam::sdk::ProtoStruct r;
+        bool have_frameset = false;
+        if (latest_frameset_) {
+          try {
+            auto fs = latest_frameset_->get();
+            auto fill = [&](char const *key, rs2::frame f) {
+              if (not f) return;
+              auto vsp = f.get_profile().as<rs2::video_stream_profile>();
+              viam::sdk::ProtoStruct sub;
+              sub["width_px"] = static_cast<double>(vsp.width());
+              sub["height_px"] = static_cast<double>(vsp.height());
+              sub["fps"] = static_cast<double>(vsp.fps());
+              sub["format"] =
+                  std::string(rs2_format_to_string(vsp.format()));
+              r[key] = sub;
+            };
+            fill("depth", fs.get_depth_frame());
+            fill("color", fs.get_color_frame());
+            have_frameset = true;
+          } catch (std::exception const &e) {
+            VIAM_RESOURCE_LOG(warn)
+                << "[get_stream_config] failed to read frameset profile: "
+                << e.what();
+          }
+        }
+        r["frames_available"] = have_frameset;
+        return r;
       }
       case DoCommand::GET_COLOR_OPTIONS: {
         viam::sdk::ProtoStruct r;
@@ -1418,6 +1540,57 @@ public:
         throw std::invalid_argument("depth_gain must be in [0, 248]");
       }
     }
+
+    // Per-stream resolution / fps validation. width/height positive ints,
+    // fps in the librealsense-supported set. Unknown sub-keys rejected.
+    static constexpr int kAllowedFps[] = {6, 15, 30, 60, 90};
+    auto validateStreamBlock = [&](char const *name) {
+      if (not attrs.count(name)) {
+        return;
+      }
+      if (not attrs[name].is_a<viam::sdk::ProtoStruct>()) {
+        throw std::invalid_argument(std::string(name) + " must be an object");
+      }
+      auto const &sub = attrs[name].get_unchecked<viam::sdk::ProtoStruct>();
+      for (auto const &[k, v] : sub) {
+        if (k != "width_px" and k != "height_px" and k != "fps") {
+          throw std::invalid_argument(std::string(name) +
+                                      ": unknown key \"" + k + "\"");
+        }
+      }
+      for (auto const *k : {"width_px", "height_px", "fps"}) {
+        auto it = sub.find(k);
+        if (it == sub.end()) {
+          throw std::invalid_argument(std::string(name) + "." + k +
+                                      " is required");
+        }
+        viam::sdk::ProtoValue const &pv = it->second;
+        if (not pv.is_a<double>()) {
+          throw std::invalid_argument(std::string(name) + "." + k +
+                                      " must be a number");
+        }
+        double d = pv.get_unchecked<double>();
+        if (d <= 0) {
+          throw std::invalid_argument(std::string(name) + "." + k +
+                                      " must be > 0");
+        }
+      }
+      int fps =
+          static_cast<int>(sub.at("fps").get_unchecked<double>());
+      bool ok = false;
+      for (int v : kAllowedFps) {
+        if (v == fps) {
+          ok = true;
+          break;
+        }
+      }
+      if (not ok) {
+        throw std::invalid_argument(std::string(name) +
+                                    ".fps must be one of 6, 15, 30, 60, 90");
+      }
+    };
+    validateStreamBlock("depth_stream");
+    validateStreamBlock("color_stream");
 
     // Color sensor tuning validation. Ranges chosen to match what the D435
     // / D435i RGB sensor accepts; values outside these get rejected by
@@ -2081,6 +2254,20 @@ private:
       native_config.color_white_balance_kelvin =
           attrs["color_white_balance_kelvin"].get_unchecked<double>();
     }
+
+    auto parseStreamBlock =
+        [&](char const *name) -> std::optional<device::StreamConfig> {
+      if (not attrs.count(name)) {
+        return std::nullopt;
+      }
+      auto const &sub = attrs[name].get_unchecked<viam::sdk::ProtoStruct>();
+      return device::StreamConfig{
+          static_cast<int>(sub.at("width_px").get_unchecked<double>()),
+          static_cast<int>(sub.at("height_px").get_unchecked<double>()),
+          static_cast<int>(sub.at("fps").get_unchecked<double>())};
+    };
+    native_config.depth_stream = parseStreamBlock("depth_stream");
+    native_config.color_stream = parseStreamBlock("color_stream");
 
     parseFilterBlocks(attrs, native_config);
 

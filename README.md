@@ -64,6 +64,8 @@ The following attributes are available for `viam:camera:realsense` cameras:
 | `color_gain` | number | Optional | Manual color-sensor gain, range `[0, 128]`. |
 | `color_white_balance_auto` | bool | Optional | Enables (`true`) or disables (`false`) auto white balance. |
 | `color_white_balance_kelvin` | number | Optional | Manual white-balance colour temperature in kelvin, range `[2800, 6500]`. Setting this implicitly disables auto-WB. |
+| `depth_stream` | object | Optional | Per-stream resolution / fps for the depth stream: `{width_px: int, height_px: int, fps: int}`. Overrides the top-level `width_px` / `height_px` for this stream. `fps` must be one of 6, 15, 30, 60, 90. |
+| `color_stream` | object | Optional | Per-stream resolution / fps for the color stream — same fields as `depth_stream`. Overrides the top-level `width_px` / `height_px` for this stream. When either per-stream block is set, the color and depth resolutions no longer need to match (rs2::align handles resampling). |
 
 ## Example configuration:
 
@@ -442,6 +444,46 @@ await camera.do_command({"set_color_white_balance": {"auto": False, "kelvin": 35
 
 # Read back current state
 await camera.do_command({"get_color_options": ""})
+```
+
+### Per-Stream Resolution / FPS
+
+The top-level `width_px` / `height_px` attributes apply to both the colour and depth streams. The optional `depth_stream` / `color_stream` blocks override that fallback for one stream at a time so you can mix resolutions — useful for a low-res depth pipeline alongside a high-res colour preview.
+
+When either per-stream block is set, the requirement that colour and depth resolutions match is lifted. `rs2::align` (enabled via `align_color_depth: true`) resamples to the colour frame regardless.
+
+#### Configuration
+
+```json
+{
+  "depth_stream": { "width_px": 848, "height_px": 480, "fps": 30 },
+  "color_stream": { "width_px": 1280, "height_px": 720, "fps": 30 }
+}
+```
+
+`fps` must be one of the librealsense-supported values: `6`, `15`, `30`, `60`, `90`. Width / height must be positive integers; unknown sub-keys in the block are rejected.
+
+#### Runtime `do_command` keys
+
+| Command | Value | Description |
+| ------- | ----- | ----------- |
+| `set_depth_stream` | `{width_px, height_px, fps}` | Stop → reconfigure → start the pipeline with the new depth profile. Synchronous; the call returns once frames flow at the new resolution. |
+| `set_color_stream` | `{width_px, height_px, fps}` | Same as above for the colour stream. |
+| `get_stream_config` | any | Return the per-stream active `{width_px, height_px, fps, format}` from the running pipeline. |
+
+> [!NOTE]
+> `set_*_stream` restarts the librealsense pipeline. Expect roughly a second of frame interruption while the new streams come up. Like the other runtime knobs, the change is not persisted: the next full `reconfigure` re-applies the resource config.
+
+#### Example using Python SDK
+
+```python
+# Switch depth to a lower resolution for cleaner stereo block matching
+await camera.do_command({
+    "set_depth_stream": {"width_px": 848, "height_px": 480, "fps": 30}
+})
+
+# Inspect what the pipeline is actually delivering
+await camera.do_command({"get_stream_config": ""})
 ```
 
 ### Locally install the module

@@ -18,6 +18,17 @@
 namespace realsense {
 namespace device {
 
+// Per-stream resolution + fps. Used by both RsResourceConfig (in
+// realsense.hpp) and createSwD2CAlignConfig / createSingleSensorConfig to
+// pick distinct profiles for the color and depth streams. When unset,
+// the top-level width/height/fps fall back to today's behaviour (matched
+// resolutions on both streams).
+struct StreamConfig {
+  int width_px{0};
+  int height_px{0};
+  int fps{0};
+};
+
 // Per-filter config blocks used by both RsResourceConfig (in realsense.hpp)
 // and DepthFilterChain. All sub-fields are optional — an unset sub-field
 // means the librealsense default value is used.

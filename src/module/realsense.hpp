@@ -13,6 +13,7 @@
 #include <viam/sdk/resource/reconfigurable.hpp>
 
 #include <librealsense2/rs.hpp>
+#include <librealsense2/rs_advanced_mode.hpp>
 
 #include <chrono>
 #include <functional>
@@ -74,6 +75,10 @@ enum class DoCommand : uint8_t {
   // Depth auto-exposure ROI rectangle.
   SET_DEPTH_AE_ROI,
   GET_DEPTH_AE_ROI,
+  // rs400 advanced mode + depth control group.
+  ENABLE_ADVANCED_MODE,
+  SET_ADVANCED_DEPTH_CONTROL,
+  GET_ADVANCED_DEPTH_CONTROL,
   UNKNOWN = std::numeric_limits<uint8_t>::max()
 };
 
@@ -122,6 +127,12 @@ static const std::unordered_map<std::string, uint8_t> DoCommandMap{
       static_cast<uint8_t>(DoCommand::SET_DEPTH_AE_ROI)},
      {"get_depth_ae_roi",
       static_cast<uint8_t>(DoCommand::GET_DEPTH_AE_ROI)},
+     {"enable_advanced_mode",
+      static_cast<uint8_t>(DoCommand::ENABLE_ADVANCED_MODE)},
+     {"set_advanced_depth_control",
+      static_cast<uint8_t>(DoCommand::SET_ADVANCED_DEPTH_CONTROL)},
+     {"get_advanced_depth_control",
+      static_cast<uint8_t>(DoCommand::GET_ADVANCED_DEPTH_CONTROL)},
      {"unknown", static_cast<uint8_t>(DoCommand::UNKNOWN)}}};
 
 const std::string service_name = "viam_realsense";
@@ -238,6 +249,13 @@ struct RsResourceConfig {
   // Auto-exposure ROI rectangle for the depth sensor. Only meaningful
   // when depth_auto_exposure is true.
   std::optional<device::DepthAeRoi> depth_ae_roi{};
+
+  // Toggle rs400 advanced mode on the device at startup. Persistent state
+  // — once enabled stays on across reconnects.
+  std::optional<bool> advanced_mode{};
+  // Per-pixel stereo matcher tuning via rs400::advanced_mode. Only applied
+  // if advanced_mode is enabled (either via this config or already on).
+  std::optional<device::AdvancedDepthControl> advanced_depth_control{};
 
   // Per-stream resolution / fps. When set, override the top-level
   // width/height fallback for that stream. Both unset → today's behaviour
@@ -625,6 +643,21 @@ public:
     return *val.template get<T>();
   }
 
+  // Run `fn` against the live rs2::device. Used by advanced-mode handlers
+  // that need device-level access (not sensor-level). Holds the device
+  // lock for the entire fn — advanced-mode calls are infrequent.
+  template <typename F> bool withDevice(F &&fn) {
+    if (not device_) {
+      return false;
+    }
+    auto guard = device_->synchronize();
+    if (not guard->device) {
+      return false;
+    }
+    fn(*guard->device);
+    return true;
+  }
+
   // Run `fn` against the depth filter chain on the live device. Holds the
   // device lock only briefly to extract a shared_ptr to the chain; mutations
   // run with the lock released. Returns false if no chain is reachable.
@@ -950,6 +983,90 @@ public:
           }
         }
         r["frames_available"] = have_frameset;
+        return r;
+      }
+      case DoCommand::ENABLE_ADVANCED_MODE: {
+        auto v = extractArg<bool>(command, "enable_advanced_mode", "a bool",
+                                  err);
+        if (not v) return err;
+        viam::sdk::ProtoStruct response;
+        bool device_present = withDevice([&](rs2::device &dev) {
+          try {
+            if (not dev.is<rs400::advanced_mode>()) {
+              response["success"] = false;
+              response["error"] = "device does not support advanced mode";
+              return;
+            }
+            auto adv = dev.as<rs400::advanced_mode>();
+            adv.toggle_advanced_mode(*v);
+            response["success"] = true;
+            response["enabled"] = *v;
+          } catch (std::exception const &e) {
+            response["success"] = false;
+            response["error"] = std::string(e.what());
+          }
+        });
+        if (not device_present) {
+          response["success"] = false;
+          response["error"] = "no live device available";
+        }
+        return response;
+      }
+      case DoCommand::SET_ADVANCED_DEPTH_CONTROL: {
+        auto const &val = command.begin()->second;
+        if (not val.is_a<viam::sdk::ProtoStruct>()) {
+          viam::sdk::ProtoStruct r;
+          r["success"] = false;
+          r["error"] = "set_advanced_depth_control expects an object";
+          return r;
+        }
+        auto const &params = val.get_unchecked<viam::sdk::ProtoStruct>();
+        auto opt_int = [&](char const *k) -> std::optional<int> {
+          auto it = params.find(k);
+          if (it == params.end()) return std::nullopt;
+          viam::sdk::ProtoValue const &pv = it->second;
+          if (not pv.is_a<double>()) return std::nullopt;
+          return static_cast<int>(pv.get_unchecked<double>());
+        };
+        device::AdvancedDepthControl adc{
+            opt_int("texture_count_threshold"),
+            opt_int("texture_difference_threshold"),
+            opt_int("score_threshold_a"),
+            opt_int("score_threshold_b"),
+            opt_int("lr_agree_threshold"),
+            opt_int("median_threshold"),
+            opt_int("neighbor_threshold")};
+        viam::sdk::ProtoStruct response;
+        bool device_present = withDevice([&](rs2::device &dev) {
+          auto e = device::applyAdvancedDepthControl(dev, adc);
+          if (e.empty()) {
+            response["success"] = true;
+          } else {
+            response["success"] = false;
+            response["error"] = e;
+          }
+        });
+        if (not device_present) {
+          response["success"] = false;
+          response["error"] = "no live device available";
+        }
+        return response;
+      }
+      case DoCommand::GET_ADVANCED_DEPTH_CONTROL: {
+        viam::sdk::ProtoStruct r;
+        std::string err_msg;
+        bool device_present = withDevice([&](rs2::device &dev) {
+          r = device::readAdvancedDepthControl(dev, err_msg);
+        });
+        if (not device_present) {
+          r["success"] = false;
+          r["error"] = "no live device available";
+        } else if (not err_msg.empty()) {
+          r["success"] = false;
+          r["error"] = err_msg;
+        } else {
+          r["success"] = true;
+        }
         return r;
       }
       case DoCommand::SET_DEPTH_AE_ROI: {
@@ -1667,6 +1784,52 @@ public:
       if (not device::isValidEmitterPattern(mode)) {
         throw std::invalid_argument(
             "emitter_pattern must be one of: off, always_on, alternate");
+      }
+    }
+
+    if (attrs.count("advanced_mode") and
+        not attrs["advanced_mode"].is_a<bool>()) {
+      throw std::invalid_argument("advanced_mode must be a bool");
+    }
+    if (attrs.count("advanced_depth_control")) {
+      if (not attrs["advanced_depth_control"].is_a<viam::sdk::ProtoStruct>()) {
+        throw std::invalid_argument(
+            "advanced_depth_control must be an object");
+      }
+      auto const &sub = attrs["advanced_depth_control"]
+                            .get_unchecked<viam::sdk::ProtoStruct>();
+      static constexpr char const *kAllowed[] = {
+          "texture_count_threshold",      "texture_difference_threshold",
+          "score_threshold_a",            "score_threshold_b",
+          "lr_agree_threshold",           "median_threshold",
+          "neighbor_threshold"};
+      for (auto const &[k, _] : sub) {
+        bool ok = false;
+        for (auto const *a : kAllowed) {
+          if (k == a) {
+            ok = true;
+            break;
+          }
+        }
+        if (not ok) {
+          throw std::invalid_argument(
+              std::string("advanced_depth_control: unknown key \"") + k +
+              "\"");
+        }
+      }
+      for (auto const &pair : sub) {
+        viam::sdk::ProtoValue const &v_proto = pair.second;
+        if (not v_proto.is_a<double>()) {
+          throw std::invalid_argument(
+              std::string("advanced_depth_control.") + pair.first +
+              " must be a number");
+        }
+        double d = v_proto.get_unchecked<double>();
+        if (d < 0) {
+          throw std::invalid_argument(
+              std::string("advanced_depth_control.") + pair.first +
+              " must be >= 0");
+        }
       }
     }
 
@@ -2407,6 +2570,29 @@ private:
     if (attrs.count("emitter_pattern")) {
       native_config.emitter_pattern =
           attrs["emitter_pattern"].get_unchecked<std::string>();
+    }
+    if (attrs.count("advanced_mode")) {
+      native_config.advanced_mode =
+          attrs["advanced_mode"].get_unchecked<bool>();
+    }
+    if (attrs.count("advanced_depth_control")) {
+      auto const &sub = attrs["advanced_depth_control"]
+                            .get_unchecked<viam::sdk::ProtoStruct>();
+      auto opt = [&](char const *k) -> std::optional<int> {
+        auto it = sub.find(k);
+        if (it == sub.end()) {
+          return std::nullopt;
+        }
+        return static_cast<int>(it->second.get_unchecked<double>());
+      };
+      native_config.advanced_depth_control = device::AdvancedDepthControl{
+          opt("texture_count_threshold"),
+          opt("texture_difference_threshold"),
+          opt("score_threshold_a"),
+          opt("score_threshold_b"),
+          opt("lr_agree_threshold"),
+          opt("median_threshold"),
+          opt("neighbor_threshold")};
     }
     if (attrs.count("depth_ae_roi")) {
       auto const &sub =

@@ -16,6 +16,7 @@
 
 #include <boost/thread/synchronized_value.hpp>
 #include <librealsense2/rs.hpp>
+#include <librealsense2/rs_advanced_mode.hpp>
 
 namespace realsense {
 namespace device {
@@ -128,9 +129,80 @@ void applyEmitterPattern(SensorT &sensor, std::string const &mode,
   }
 }
 
+// Read the current advanced-mode depth control group, overlay any fields
+// provided in `cfg`, write it back. Returns an empty string on success,
+// or a diagnostic if advanced mode isn't enabled or the API throws.
+template <typename DeviceT>
+std::string
+applyAdvancedDepthControl(DeviceT &dev, AdvancedDepthControl const &cfg) {
+  try {
+    if (not dev.template is<rs400::advanced_mode>()) {
+      return "device does not support advanced mode";
+    }
+    auto adv = dev.template as<rs400::advanced_mode>();
+    if (not adv.is_enabled()) {
+      return "advanced mode is not enabled (call enable_advanced_mode "
+             "first)";
+    }
+    STDepthControlGroup grp = adv.get_depth_control(0);
+    if (cfg.texture_count_threshold)
+      grp.textureCountThreshold = *cfg.texture_count_threshold;
+    if (cfg.texture_difference_threshold)
+      grp.textureDifferenceThreshold = *cfg.texture_difference_threshold;
+    if (cfg.score_threshold_a)
+      grp.scoreThreshA = *cfg.score_threshold_a;
+    if (cfg.score_threshold_b)
+      grp.scoreThreshB = *cfg.score_threshold_b;
+    if (cfg.lr_agree_threshold)
+      grp.lrAgreeThreshold = *cfg.lr_agree_threshold;
+    if (cfg.median_threshold)
+      grp.deepSeaMedianThreshold = *cfg.median_threshold;
+    if (cfg.neighbor_threshold)
+      grp.deepSeaNeighborThreshold = *cfg.neighbor_threshold;
+    adv.set_depth_control(grp);
+  } catch (std::exception const &e) {
+    return e.what();
+  }
+  return {};
+}
+
+// Read the current advanced-mode depth control group into a ProtoStruct
+// suitable for the get_advanced_depth_control do_command response.
+template <typename DeviceT>
+viam::sdk::ProtoStruct readAdvancedDepthControl(DeviceT &dev,
+                                                std::string &err_out) {
+  viam::sdk::ProtoStruct r;
+  try {
+    if (not dev.template is<rs400::advanced_mode>()) {
+      err_out = "device does not support advanced mode";
+      return r;
+    }
+    auto adv = dev.template as<rs400::advanced_mode>();
+    if (not adv.is_enabled()) {
+      err_out = "advanced mode is not enabled";
+      return r;
+    }
+    STDepthControlGroup grp = adv.get_depth_control(0);
+    r["texture_count_threshold"] =
+        static_cast<double>(grp.textureCountThreshold);
+    r["texture_difference_threshold"] =
+        static_cast<double>(grp.textureDifferenceThreshold);
+    r["score_threshold_a"] = static_cast<double>(grp.scoreThreshA);
+    r["score_threshold_b"] = static_cast<double>(grp.scoreThreshB);
+    r["lr_agree_threshold"] = static_cast<double>(grp.lrAgreeThreshold);
+    r["median_threshold"] =
+        static_cast<double>(grp.deepSeaMedianThreshold);
+    r["neighbor_threshold"] =
+        static_cast<double>(grp.deepSeaNeighborThreshold);
+  } catch (std::exception const &e) {
+    err_out = e.what();
+  }
+  return r;
+}
+
 // Apply an auto-exposure ROI rectangle to the depth sensor. Wraps
 // rs2::roi_sensor::set_region_of_interest. Returns an empty string on
-// success, or an error description if the cast / call fails.
+// success, or a diagnostic if the cast / call fails.
 template <typename SensorT, typename RoiSensorT = rs2::roi_sensor>
 std::string applyDepthAeRoi(SensorT &sensor, DepthAeRoi const &roi) {
   if (not sensor.template is<RoiSensorT>()) {
@@ -913,6 +985,36 @@ createDevice(std::string const &serial_number, std::shared_ptr<DeviceT> dev,
   my_dev->align = std::make_shared<std::decay_t<decltype(*my_dev->align)>>(
       RS2_STREAM_COLOR);
   my_dev->config = config;
+
+  // Advanced-mode toggle + depth control group must be applied on the
+  // rs2::device (not the sensor). Real rs2::device only — mock paths
+  // gated at compile time.
+  if constexpr (std::is_same_v<DeviceT, rs2::device>) {
+    if (viamConfig.advanced_mode) {
+      try {
+        if (dev->template is<rs400::advanced_mode>()) {
+          auto adv = dev->template as<rs400::advanced_mode>();
+          adv.toggle_advanced_mode(*viamConfig.advanced_mode);
+          VIAM_DEVICE_LOG(logger, info)
+              << "[createDevice] advanced_mode=" << *viamConfig.advanced_mode;
+        }
+      } catch (std::exception const &e) {
+        VIAM_DEVICE_LOG(logger, warn)
+            << "[createDevice] toggle_advanced_mode failed: " << e.what();
+      }
+    }
+    if (viamConfig.advanced_depth_control) {
+      auto err =
+          applyAdvancedDepthControl(*dev, *viamConfig.advanced_depth_control);
+      if (not err.empty()) {
+        VIAM_DEVICE_LOG(logger, warn)
+            << "[createDevice] advanced_depth_control: " << err;
+      } else {
+        VIAM_DEVICE_LOG(logger, info)
+            << "[createDevice] applied advanced_depth_control";
+      }
+    }
+  }
 
   VIAM_DEVICE_LOG(logger, info) << "[createDevice] created " << serial_number;
   return std::make_shared<boost::synchronized_value<ViamDeviceT>>(my_dev);

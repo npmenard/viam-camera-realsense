@@ -39,6 +39,19 @@ struct DepthAeRoi {
   int max_y{0};
 };
 
+// rs400 advanced-mode depth control group fields. Each is optional so
+// set_advanced_depth_control does a read-modify-write — fields the caller
+// didn't supply keep their current value.
+struct AdvancedDepthControl {
+  std::optional<int> texture_count_threshold{};      // 0..31
+  std::optional<int> texture_difference_threshold{}; // 0..4095
+  std::optional<int> score_threshold_a{};            // 0..127
+  std::optional<int> score_threshold_b{};            // 0..1023
+  std::optional<int> lr_agree_threshold{};           // 0..63
+  std::optional<int> median_threshold{};             // 0..1023
+  std::optional<int> neighbor_threshold{};           // 0..1023
+};
+
 // Per-filter config blocks used by both RsResourceConfig (in realsense.hpp)
 // and DepthFilterChain. All sub-fields are optional — an unset sub-field
 // means the librealsense default value is used.

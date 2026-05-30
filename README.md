@@ -56,6 +56,8 @@ The following attributes are available for `viam:camera:realsense` cameras:
 | `depth_gain` | number | Optional | Manual depth-sensor gain in the range `[0, 248]`. If omitted, the camera keeps its current gain. |
 | `emitter_pattern` | string | Optional | IR-projector mode: `"off"`, `"always_on"`, or `"alternate"` (emitter on every other frame). Superset of `depth_emitter_enabled`; when both are set, `emitter_pattern` wins and a warning is logged. |
 | `depth_ae_roi` | object | Optional | Restrict depth auto-exposure to a sub-rectangle of the frame: `{min_x: int, min_y: int, max_x: int, max_y: int}`. Only meaningful with `depth_auto_exposure: true`. Only D4xx variants that expose `rs2::roi_sensor` (the D435 / D435i / D415 all do) accept this; the helper logs a warning and skips otherwise. |
+| `advanced_mode` | bool | Optional | Toggle rs400 advanced mode on the device at startup. Advanced-mode state persists across reconnects, so only set this when you want to change it. |
+| `advanced_depth_control` | object | Optional | Per-pixel stereo matcher tuning via `rs400::advanced_mode`. Read-modify-write — only the provided sub-fields are updated, others retain their previous value. Sub-fields (all optional, all non-negative integers): `texture_count_threshold`, `texture_difference_threshold`, `score_threshold_a`, `score_threshold_b`, `lr_agree_threshold`, `median_threshold`, `neighbor_threshold`. Requires advanced mode to be enabled. |
 | `decimation_filter` | object | Optional | Enables the `rs2::decimation_filter` post-processing step. Sub-fields: `magnitude` (int, 2..8). See the [Depth Post-Processing Filters](#depth-post-processing-filters) section. |
 | `depth_clip_distance` | object | Optional | Enables the `rs2::threshold_filter` to drop depth pixels outside `[min_m, max_m]` (both in metres, range `[0, 10]`). |
 | `spatial_filter` | object | Optional | Enables `rs2::spatial_filter`. Sub-fields: `magnitude` (int, 1..5), `smooth_alpha` (number, 0.25..1.0), `smooth_delta` (int, 1..50), `hole_fill` (int, 0..5). |
@@ -318,6 +320,9 @@ Each command takes exactly one key. The supported commands are:
 | `set_emitter_pattern` | string | `"off"`, `"always_on"`, or `"alternate"`. |
 | `set_depth_ae_roi` | `{min_x, min_y, max_x, max_y}` | Set the auto-exposure ROI rectangle on the depth sensor. |
 | `get_depth_ae_roi` | any | Read the current depth AE ROI (or report `supported: false` on cameras without `rs2::roi_sensor`). |
+| `enable_advanced_mode` | bool | Toggle rs400 advanced mode on the device. Persistent across reconnects. |
+| `set_advanced_depth_control` | object | Read-modify-write of the `STDepthControlGroup` — same sub-fields as the `advanced_depth_control` config attribute. Errors if advanced mode is not enabled. |
+| `get_advanced_depth_control` | any | Return the current `STDepthControlGroup` values. |
 | `get_depth_options` | any | Read back the current depth-sensor option values. |
 
 > [!NOTE]

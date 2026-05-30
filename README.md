@@ -499,6 +499,88 @@ await camera.do_command({
 await camera.do_command({"get_stream_config": ""})
 ```
 
+### Emitter Pattern
+
+`depth_emitter_enabled` toggles the IR projector on or off. `emitter_pattern` adds two additional modes that the simple bool can't express:
+
+| Mode | Effect on the depth sensor |
+| ---- | -------------------------- |
+| `"off"` | `RS2_OPTION_EMITTER_ENABLED = 0`. Same as `depth_emitter_enabled: false`. |
+| `"always_on"` | `RS2_OPTION_EMITTER_ENABLED = 1` and `RS2_OPTION_EMITTER_ALWAYS_ON = 1`. Projector stays lit even during frames that wouldn't normally use it. |
+| `"alternate"` | `RS2_OPTION_EMITTER_ENABLED = 1` and `RS2_OPTION_EMITTER_ON_OFF = 1`. Projector toggles every other frame — useful for collecting matched IR-pattern / no-IR-pattern pairs. |
+
+`emitter_pattern` and `depth_emitter_enabled` overlap on the `"off"` case. When both are set, `emitter_pattern` wins and a warning is logged.
+
+```python
+await camera.do_command({"set_emitter_pattern": "alternate"})
+```
+
+### Depth Auto-Exposure ROI
+
+When `depth_auto_exposure: true`, the depth sensor adapts exposure to the whole-frame brightness histogram. `depth_ae_roi` restricts that histogram to a sub-rectangle so AE only reacts to a region of interest (e.g. a chess board in the centre, ignoring bright periphery).
+
+```python
+# Restrict depth AE to the centre of a 640x480 depth frame
+await camera.do_command({
+    "set_depth_ae_roi": {"min_x": 160, "min_y": 120, "max_x": 480, "max_y": 360}
+})
+
+# Inspect the active ROI
+await camera.do_command({"get_depth_ae_roi": ""})
+# -> {"supported": True, "min_x": 160, "min_y": 120, "max_x": 480, "max_y": 360, ...}
+```
+
+> [!NOTE]
+> Only D4xx variants that expose `rs2::roi_sensor` (D435 / D435i / D415) accept this. On unsupported variants `get_depth_ae_roi` returns `supported: false` and `set_depth_ae_roi` returns a structured error.
+
+### rs400 Advanced Mode
+
+Advanced mode unlocks the per-pixel stereo matcher tuning sitting behind `STDepthControlGroup`. The device must be put into advanced mode first; advanced-mode state is **persistent** across reconnects so this is usually a one-time call:
+
+```python
+await camera.do_command({"enable_advanced_mode": True})
+```
+
+`set_advanced_depth_control` is read-modify-write — only the sub-fields you pass are updated; everything else keeps its current value. This lets you tune one knob at a time without having to know the whole control group up-front:
+
+```python
+# Loosen the LR-agree threshold a touch
+await camera.do_command({
+    "set_advanced_depth_control": {"lr_agree_threshold": 16}
+})
+
+# Read everything back
+await camera.do_command({"get_advanced_depth_control": ""})
+```
+
+If advanced mode is off, `set_/get_advanced_depth_control` return `{success: false, error: "advanced mode is not enabled"}`.
+
+> [!WARNING]
+> These are stereo-matcher internals — don't tune blind. Intel's [advanced-mode tuning whitepaper](https://dev.intelrealsense.com/docs/d400-series-visual-presets) covers what each field actually does.
+
+### Hardware HDR
+
+D435 / D435i support hardware HDR on the depth sensor: the camera alternates between two depth sub-exposures every other frame. Consumers see a **single interleaved depth stream** whose frames flicker between the two settings, effectively widening the dynamic range without exposing sequence IDs.
+
+```python
+await camera.do_command({
+    "set_hdr": {
+        "enabled": True,
+        "exposure_short_us": 1500,
+        "exposure_long_us": 8000,
+        "gain_short": 16,
+        "gain_long": 64,
+    }
+})
+
+await camera.do_command({"get_hdr": ""})
+# -> {"supported": True, "enabled": 1.0, "sequence_size": 2.0,
+#     "exposure_short_us": 1500.0, "exposure_long_us": 8000.0, ...}
+```
+
+> [!NOTE]
+> HDR overrides `depth_exposure_us` and `depth_auto_exposure` when both are set — a warning is logged. The viam SDK has no slot for per-frame metadata, so downstream consumers can't tell which sub-exposure produced any given frame; they only see that the effective dynamic range is wider. If you need to demux short vs long frames yourself, that requires SDK-level changes outside this module.
+
 ### Locally install the module
 
 If you are using a Linux machine, and do not want to use the Viam registry, you can [download the module code from the registry](https://app.viam.com/module/viam/realsense) and use it directly on your machine.

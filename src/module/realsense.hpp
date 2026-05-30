@@ -51,6 +51,14 @@ enum class DoCommand : uint8_t {
   SET_DEPTH_AUTO_EXPOSURE, // bool
   SET_DEPTH_GAIN,          // double 0..248
   GET_DEPTH_OPTIONS,       // no payload (any value) — returns current values
+  // Runtime depth post-processing filter tuning. Each takes a ProtoStruct
+  // value with the filter's tuning fields plus an optional "enabled" bool.
+  SET_DECIMATION_FILTER,
+  SET_DEPTH_CLIP_DISTANCE,
+  SET_SPATIAL_FILTER,
+  SET_TEMPORAL_FILTER,
+  SET_HOLE_FILLING_FILTER,
+  GET_FILTER_OPTIONS, // no payload (any value) — returns current filter state
   UNKNOWN = std::numeric_limits<uint8_t>::max()
 };
 
@@ -66,6 +74,18 @@ static const std::unordered_map<std::string, uint8_t> DoCommandMap{
       static_cast<uint8_t>(DoCommand::SET_DEPTH_AUTO_EXPOSURE)},
      {"set_depth_gain", static_cast<uint8_t>(DoCommand::SET_DEPTH_GAIN)},
      {"get_depth_options", static_cast<uint8_t>(DoCommand::GET_DEPTH_OPTIONS)},
+     {"set_decimation_filter",
+      static_cast<uint8_t>(DoCommand::SET_DECIMATION_FILTER)},
+     {"set_depth_clip_distance",
+      static_cast<uint8_t>(DoCommand::SET_DEPTH_CLIP_DISTANCE)},
+     {"set_spatial_filter",
+      static_cast<uint8_t>(DoCommand::SET_SPATIAL_FILTER)},
+     {"set_temporal_filter",
+      static_cast<uint8_t>(DoCommand::SET_TEMPORAL_FILTER)},
+     {"set_hole_filling_filter",
+      static_cast<uint8_t>(DoCommand::SET_HOLE_FILLING_FILTER)},
+     {"get_filter_options",
+      static_cast<uint8_t>(DoCommand::GET_FILTER_OPTIONS)},
      {"unknown", static_cast<uint8_t>(DoCommand::UNKNOWN)}}};
 
 const std::string service_name = "viam_realsense";
@@ -174,6 +194,15 @@ struct RsResourceConfig {
   std::optional<double> depth_exposure_us{};
   std::optional<bool> depth_auto_exposure{};
   std::optional<double> depth_gain{};
+
+  // Depth post-processing filter chain. All optional. Each block, when set,
+  // enables that filter (applied in the Intel-recommended order); leaving
+  // a block unset disables that filter — the default zero-overhead path.
+  std::optional<device::DecimationFilterConfig> decimation_filter{};
+  std::optional<device::DepthClipFilterConfig> depth_clip_distance{};
+  std::optional<device::SpatialFilterConfig> spatial_filter{};
+  std::optional<device::TemporalFilterConfig> temporal_filter{};
+  std::optional<device::HoleFillingFilterConfig> hole_filling_filter{};
 
   RsResourceConfig() = default;
 
@@ -459,6 +488,48 @@ public:
     return *val.template get<T>();
   }
 
+  // Run `fn` against the depth filter chain on the live device. Holds the
+  // device lock only briefly to extract a shared_ptr to the chain; mutations
+  // run with the lock released. Returns false if no chain is reachable.
+  template <typename F> bool withDepthFilterChain(F &&fn) {
+    if (not device_) {
+      return false;
+    }
+    std::shared_ptr<device::DepthFilterChain> chain;
+    {
+      auto guard = device_->synchronize();
+      chain = guard->depth_filter_chain;
+    }
+    if (not chain) {
+      return false;
+    }
+    fn(*chain);
+    return true;
+  }
+
+  // Apply a runtime filter update to the live chain and report the result.
+  viam::sdk::ProtoStruct
+  updateFilterChain(std::string const &filter_name,
+                    viam::sdk::ProtoStruct const &params) {
+    viam::sdk::ProtoStruct response;
+    bool chain_present =
+        withDepthFilterChain([&](device::DepthFilterChain &chain) {
+          try {
+            chain.update(filter_name, params, this->logger_);
+            response["success"] = true;
+            response["filter"] = filter_name;
+          } catch (std::exception const &e) {
+            response["success"] = false;
+            response["error"] = std::string(e.what());
+          }
+        });
+    if (not chain_present) {
+      response["success"] = false;
+      response["error"] = "no depth filter chain available";
+    }
+    return response;
+  }
+
   viam::sdk::ProtoStruct
   do_command(const viam::sdk::ProtoStruct &command) override {
     VIAM_RESOURCE_LOG(info)
@@ -574,6 +645,31 @@ public:
         r["sensor_present"] = sensor_present;
         return r;
       }
+      case DoCommand::SET_DECIMATION_FILTER:
+      case DoCommand::SET_DEPTH_CLIP_DISTANCE:
+      case DoCommand::SET_SPATIAL_FILTER:
+      case DoCommand::SET_TEMPORAL_FILTER:
+      case DoCommand::SET_HOLE_FILLING_FILTER: {
+        auto const &cmd_name = command.begin()->first;
+        auto const &val = command.begin()->second;
+        if (not val.is_a<viam::sdk::ProtoStruct>()) {
+          viam::sdk::ProtoStruct r;
+          r["success"] = false;
+          r["error"] = cmd_name + " expects an object";
+          return r;
+        }
+        auto const &params = *val.get<viam::sdk::ProtoStruct>();
+        // Map command name → filter name (drop the "set_" prefix).
+        std::string filter_name = cmd_name.substr(4);
+        return updateFilterChain(filter_name, params);
+      }
+      case DoCommand::GET_FILTER_OPTIONS: {
+        viam::sdk::ProtoStruct r;
+        bool chain_present = withDepthFilterChain(
+            [&](device::DepthFilterChain &c) { r = c.snapshot(); });
+        r["chain_present"] = chain_present;
+        return r;
+      }
       default:
         break;
       }
@@ -662,6 +758,13 @@ public:
       VIAM_RESOURCE_LOG(debug) << "[get_images] start";
       std::string serial_number = config_->serial_number;
       auto fs = latest_frameset_->get();
+
+      // Run the depth post-processing filter chain before align so that
+      // align consumes filtered depth. No-op when no filter is enabled
+      // (the default path) — chain.process() returns the input frameset
+      // unchanged.
+      withDepthFilterChain(
+          [&](device::DepthFilterChain &c) { fs = c.process(fs); });
 
       // Optionally align depth to color so that depth_np[v, u] and
       // color_np[v, u] refer to the same physical point. The IR/depth and
@@ -832,6 +935,12 @@ public:
 
         if (not my_dev->started) {
           throw std::runtime_error("device is not started");
+        }
+
+        // Apply the depth filter chain before deprojection so the point
+        // cloud matches what GetImages sees.
+        if (my_dev->depth_filter_chain) {
+          fs = my_dev->depth_filter_chain->process(fs);
         }
 
         data = encoding::encodeRGBPointsToPCD(
@@ -1146,6 +1255,33 @@ public:
       }
     }
 
+    // Depth post-processing filter chain validation. Each block is an
+    // optional sub-struct whose sub-fields are validated against librealsense
+    // option ranges. Unknown sub-keys are rejected to catch typos.
+    validateNumericRange(attrs, "decimation_filter", "magnitude", 2, 8);
+    validateFilterKeys(attrs, "decimation_filter", {"magnitude"});
+
+    validateNumericRange(attrs, "depth_clip_distance", "min_m", 0.0, 10.0);
+    validateNumericRange(attrs, "depth_clip_distance", "max_m", 0.0, 10.0);
+    validateFilterKeys(attrs, "depth_clip_distance", {"min_m", "max_m"});
+
+    validateNumericRange(attrs, "spatial_filter", "magnitude", 1, 5);
+    validateNumericRange(attrs, "spatial_filter", "smooth_alpha", 0.25, 1.0);
+    validateNumericRange(attrs, "spatial_filter", "smooth_delta", 1, 50);
+    validateNumericRange(attrs, "spatial_filter", "hole_fill", 0, 5);
+    validateFilterKeys(
+        attrs, "spatial_filter",
+        {"magnitude", "smooth_alpha", "smooth_delta", "hole_fill"});
+
+    validateNumericRange(attrs, "temporal_filter", "smooth_alpha", 0.0, 1.0);
+    validateNumericRange(attrs, "temporal_filter", "smooth_delta", 1, 100);
+    validateNumericRange(attrs, "temporal_filter", "persistence", 0, 8);
+    validateFilterKeys(attrs, "temporal_filter",
+                       {"smooth_alpha", "smooth_delta", "persistence"});
+
+    validateNumericRange(attrs, "hole_filling_filter", "mode", 0, 2);
+    validateFilterKeys(attrs, "hole_filling_filter", {"mode"});
+
     if (attrs.count("align_color_depth")) {
       if (not attrs["align_color_depth"].is_a<bool>()) {
         throw std::invalid_argument("align_color_depth must be a bool");
@@ -1178,6 +1314,65 @@ public:
     // If we reach here, the serial number is valid
     return {};
   }
+
+  // Validate that a sub-field of an optional filter block has the right
+  // numeric type and is within range. Silently returns if the block or the
+  // sub-field is absent — every field is optional within an optional block.
+  static void validateNumericRange(viam::sdk::ProtoStruct &attrs,
+                                   char const *block, char const *field,
+                                   double lo, double hi) {
+    if (not attrs.count(block)) {
+      return;
+    }
+    if (not attrs[block].is_a<viam::sdk::ProtoStruct>()) {
+      throw std::invalid_argument(std::string(block) + " must be an object");
+    }
+    viam::sdk::ProtoStruct const &sub =
+        attrs[block].get_unchecked<viam::sdk::ProtoStruct>();
+    auto it = sub.find(field);
+    if (it == sub.end()) {
+      return;
+    }
+    viam::sdk::ProtoValue const &v_proto = it->second;
+    if (not v_proto.is_a<double>()) {
+      throw std::invalid_argument(std::string(block) + "." + field +
+                                  " must be a number");
+    }
+    double v = v_proto.get_unchecked<double>();
+    if (v < lo or v > hi) {
+      throw std::invalid_argument(std::string(block) + "." + field +
+                                  " out of range");
+    }
+  }
+
+  // Reject unknown sub-keys in a filter block so config typos surface at
+  // load time instead of being silently ignored.
+  static void
+  validateFilterKeys(viam::sdk::ProtoStruct &attrs, char const *block,
+                     std::initializer_list<char const *> allowed) {
+    if (not attrs.count(block)) {
+      return;
+    }
+    if (not attrs[block].is_a<viam::sdk::ProtoStruct>()) {
+      return; // already reported by validateNumericRange
+    }
+    viam::sdk::ProtoStruct const &sub =
+        attrs[block].get_unchecked<viam::sdk::ProtoStruct>();
+    for (auto const &[k, _] : sub) {
+      bool ok = false;
+      for (auto const *a : allowed) {
+        if (k == a) {
+          ok = true;
+          break;
+        }
+      }
+      if (not ok) {
+        throw std::invalid_argument(std::string(block) +
+                                    ": unknown key \"" + k + "\"");
+      }
+    }
+  }
+
   static inline viam::sdk::Model model{"viam", "camera", "realsense"};
 
   // Handles device changes for this instance
@@ -1660,7 +1855,65 @@ private:
       native_config.depth_gain = attrs["depth_gain"].get_unchecked<double>();
     }
 
+    parseFilterBlocks(attrs, native_config);
+
     return native_config;
+  }
+
+  // Pull each optional depth-filter block out of the resource config into
+  // the matching RsResourceConfig field. Presence of the block enables the
+  // filter; sub-fields override librealsense defaults.
+  static void parseFilterBlocks(viam::sdk::ProtoStruct &attrs,
+                                realsense::RsResourceConfig &cfg) {
+    auto optInt = [](viam::sdk::ProtoStruct const &s,
+                     char const *k) -> std::optional<int> {
+      auto it = s.find(k);
+      if (it == s.end()) {
+        return std::nullopt;
+      }
+      return static_cast<int>(it->second.get_unchecked<double>());
+    };
+    auto optDouble = [](viam::sdk::ProtoStruct const &s,
+                        char const *k) -> std::optional<double> {
+      auto it = s.find(k);
+      if (it == s.end()) {
+        return std::nullopt;
+      }
+      return it->second.get_unchecked<double>();
+    };
+
+    if (attrs.count("decimation_filter")) {
+      auto const &s =
+          attrs["decimation_filter"].get_unchecked<viam::sdk::ProtoStruct>();
+      cfg.decimation_filter =
+          device::DecimationFilterConfig{optInt(s, "magnitude")};
+    }
+    if (attrs.count("depth_clip_distance")) {
+      auto const &s =
+          attrs["depth_clip_distance"].get_unchecked<viam::sdk::ProtoStruct>();
+      cfg.depth_clip_distance = device::DepthClipFilterConfig{
+          optDouble(s, "min_m"), optDouble(s, "max_m")};
+    }
+    if (attrs.count("spatial_filter")) {
+      auto const &s =
+          attrs["spatial_filter"].get_unchecked<viam::sdk::ProtoStruct>();
+      cfg.spatial_filter = device::SpatialFilterConfig{
+          optInt(s, "magnitude"), optDouble(s, "smooth_alpha"),
+          optInt(s, "smooth_delta"), optInt(s, "hole_fill")};
+    }
+    if (attrs.count("temporal_filter")) {
+      auto const &s =
+          attrs["temporal_filter"].get_unchecked<viam::sdk::ProtoStruct>();
+      cfg.temporal_filter = device::TemporalFilterConfig{
+          optDouble(s, "smooth_alpha"), optInt(s, "smooth_delta"),
+          optInt(s, "persistence")};
+    }
+    if (attrs.count("hole_filling_filter")) {
+      auto const &s =
+          attrs["hole_filling_filter"].get_unchecked<viam::sdk::ProtoStruct>();
+      cfg.hole_filling_filter =
+          device::HoleFillingFilterConfig{optInt(s, "mode")};
+    }
   }
   static DeviceFunctions createDefaultDeviceFunctions() {
     return DeviceFunctions{

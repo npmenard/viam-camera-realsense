@@ -1296,6 +1296,127 @@ TEST_F(DeviceTest,
       << "Should log that matching profiles were found";
 }
 
+// ---------------------------------------------------------------------------
+// DepthFilterChain tests
+// ---------------------------------------------------------------------------
+
+namespace {
+// Minimal stand-in for RsResourceConfig that satisfies the template
+// constructor — only the fields the constructor reads. Keeps the tests
+// independent of the full RsResourceConfig surface.
+struct FilterCfg {
+  std::optional<DecimationFilterConfig> decimation_filter{};
+  std::optional<DepthClipFilterConfig> depth_clip_distance{};
+  std::optional<SpatialFilterConfig> spatial_filter{};
+  std::optional<TemporalFilterConfig> temporal_filter{};
+  std::optional<HoleFillingFilterConfig> hole_filling_filter{};
+};
+} // namespace
+
+TEST_F(DeviceTest, DepthFilterChain_Snapshot_AllDisabledByDefault) {
+  DepthFilterChain chain{FilterCfg{}};
+  auto snap = chain.snapshot();
+  for (auto const &k :
+       {"decimation_filter", "depth_clip_distance", "spatial_filter",
+        "temporal_filter", "hole_filling_filter"}) {
+    ASSERT_TRUE(snap.count(k)) << k;
+    auto const &block = snap[k].get_unchecked<viam::sdk::ProtoStruct>();
+    ASSERT_TRUE(block.count("enabled"));
+    EXPECT_FALSE(block.at("enabled").get_unchecked<bool>())
+        << k << ".enabled should default false";
+  }
+}
+
+TEST_F(DeviceTest,
+       DepthFilterChain_ConstructorEnablesFiltersWhenConfigBlocksPresent) {
+  FilterCfg cfg;
+  cfg.spatial_filter = SpatialFilterConfig{};
+  cfg.temporal_filter = TemporalFilterConfig{};
+  DepthFilterChain chain{cfg};
+
+  auto snap = chain.snapshot();
+  EXPECT_TRUE(snap["spatial_filter"]
+                  .get_unchecked<viam::sdk::ProtoStruct>()
+                  .at("enabled")
+                  .get_unchecked<bool>());
+  EXPECT_TRUE(snap["temporal_filter"]
+                  .get_unchecked<viam::sdk::ProtoStruct>()
+                  .at("enabled")
+                  .get_unchecked<bool>());
+  EXPECT_FALSE(snap["decimation_filter"]
+                   .get_unchecked<viam::sdk::ProtoStruct>()
+                   .at("enabled")
+                   .get_unchecked<bool>());
+}
+
+TEST_F(DeviceTest, DepthFilterChain_UpdateTogglesEnabled) {
+  test_utils::LogCaptureFixture log_capture;
+  viam::sdk::LogSource logger;
+  DepthFilterChain chain{FilterCfg{}};
+
+  viam::sdk::ProtoStruct on;
+  on["enabled"] = true;
+  chain.update("spatial_filter", on, logger);
+
+  auto snap1 = chain.snapshot();
+  EXPECT_TRUE(snap1["spatial_filter"]
+                  .get_unchecked<viam::sdk::ProtoStruct>()
+                  .at("enabled")
+                  .get_unchecked<bool>());
+
+  viam::sdk::ProtoStruct off;
+  off["enabled"] = false;
+  chain.update("spatial_filter", off, logger);
+
+  auto snap2 = chain.snapshot();
+  EXPECT_FALSE(snap2["spatial_filter"]
+                   .get_unchecked<viam::sdk::ProtoStruct>()
+                   .at("enabled")
+                   .get_unchecked<bool>());
+}
+
+TEST_F(DeviceTest, DepthFilterChain_UpdatePersistsTuningWithoutEnabledKey) {
+  test_utils::LogCaptureFixture log_capture;
+  viam::sdk::LogSource logger;
+  DepthFilterChain chain{FilterCfg{}};
+
+  // Enable temporal first.
+  viam::sdk::ProtoStruct enable;
+  enable["enabled"] = true;
+  chain.update("temporal_filter", enable, logger);
+
+  // Tune without sending "enabled" — should remain enabled, alpha updated.
+  viam::sdk::ProtoStruct tune;
+  tune["smooth_alpha"] = 0.42;
+  chain.update("temporal_filter", tune, logger);
+
+  auto snap = chain.snapshot();
+  auto const &tp = snap["temporal_filter"].get_unchecked<viam::sdk::ProtoStruct>();
+  EXPECT_TRUE(tp.at("enabled").get_unchecked<bool>());
+  ASSERT_TRUE(tp.count("smooth_alpha"));
+  EXPECT_NEAR(tp.at("smooth_alpha").get_unchecked<double>(), 0.42, 1e-3);
+}
+
+TEST_F(DeviceTest, DepthFilterChain_UpdateRejectsUnknownFilter) {
+  test_utils::LogCaptureFixture log_capture;
+  viam::sdk::LogSource logger;
+  DepthFilterChain chain{FilterCfg{}};
+  viam::sdk::ProtoStruct p;
+  p["enabled"] = true;
+  EXPECT_THROW(chain.update("nonexistent_filter", p, logger),
+               std::invalid_argument);
+}
+
+TEST_F(DeviceTest, DepthFilterChain_UpdateRejectsWrongType) {
+  test_utils::LogCaptureFixture log_capture;
+  viam::sdk::LogSource logger;
+  DepthFilterChain chain{FilterCfg{}};
+  viam::sdk::ProtoStruct p;
+  p["enabled"] = std::string("not a bool");
+  EXPECT_THROW(chain.update("spatial_filter", p, logger),
+               std::invalid_argument);
+}
+
 } // namespace test
 } // namespace device
 } // namespace realsense

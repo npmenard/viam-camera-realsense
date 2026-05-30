@@ -54,6 +54,11 @@ The following attributes are available for `viam:camera:realsense` cameras:
 | `depth_exposure_us` | number | Optional | Manual depth-sensor exposure in microseconds, in the range `[1, 200000]`. Setting this implicitly disables auto-exposure on the depth stream. If omitted, the camera keeps its current exposure behavior. |
 | `depth_auto_exposure` | bool | Optional | Enables (`true`) or disables (`false`) auto-exposure on the depth sensor. If both `depth_auto_exposure` and `depth_exposure_us` are set, manual exposure wins and a warning is logged. |
 | `depth_gain` | number | Optional | Manual depth-sensor gain in the range `[0, 248]`. If omitted, the camera keeps its current gain. |
+| `decimation_filter` | object | Optional | Enables the `rs2::decimation_filter` post-processing step. Sub-fields: `magnitude` (int, 2..8). See the [Depth Post-Processing Filters](#depth-post-processing-filters) section. |
+| `depth_clip_distance` | object | Optional | Enables the `rs2::threshold_filter` to drop depth pixels outside `[min_m, max_m]` (both in metres, range `[0, 10]`). |
+| `spatial_filter` | object | Optional | Enables `rs2::spatial_filter`. Sub-fields: `magnitude` (int, 1..5), `smooth_alpha` (number, 0.25..1.0), `smooth_delta` (int, 1..50), `hole_fill` (int, 0..5). |
+| `temporal_filter` | object | Optional | Enables `rs2::temporal_filter`. Sub-fields: `smooth_alpha` (number, 0..1), `smooth_delta` (int, 1..100), `persistence` (int, 0..8). |
+| `hole_filling_filter` | object | Optional | Enables `rs2::hole_filling_filter`. Sub-fields: `mode` (int, 0=fill-from-left, 1=farthest-around, 2=nearest-around). See the caveat in the [Depth Post-Processing Filters](#depth-post-processing-filters) section before enabling. |
 
 ## Example configuration:
 
@@ -321,6 +326,72 @@ state = await camera.do_command({"get_depth_options": ""})
 ```
 
 Each `set_*` command returns a `ProtoStruct` with `success` (bool) plus either the applied `option` / `value` or an `error` string. `get_depth_options` returns a `sensor_present` flag plus the current value of every option the depth sensor exposes (`visual_preset` is returned as a string for symmetry with the SET path).
+
+### Depth Post-Processing Filters
+
+A configurable chain of librealsense post-processing filters can be applied to the depth stream before it reaches `GetImages` or `GetPointCloud`. **All filters are opt-in** — if no filter block appears in the config and no `set_*_filter` `do_command` has been issued, the depth output is byte-identical to the pre-filter behaviour (zero overhead).
+
+Filter order is **fixed** at Intel's recommended pipeline; you cannot reorder it:
+
+```
+decimation → threshold → disparity(true) → spatial → temporal → disparity(false) → hole_filling
+```
+
+The `disparity_transform` wrap around spatial+temporal is applied automatically whenever either of those two filters is enabled, because both work meaningfully better in disparity space.
+
+#### Configuration
+
+Add any subset of the following blocks to the component's `attributes`. Each sub-field is itself optional — omit a sub-field to keep the librealsense default for that option.
+
+```json
+{
+  "decimation_filter":   { "magnitude": 2 },
+  "depth_clip_distance": { "min_m": 0.5, "max_m": 4.0 },
+  "spatial_filter":      { "magnitude": 2, "smooth_alpha": 0.5, "smooth_delta": 20, "hole_fill": 0 },
+  "temporal_filter":     { "smooth_alpha": 0.4, "smooth_delta": 20, "persistence": 3 },
+  "hole_filling_filter": { "mode": 1 }
+}
+```
+
+#### Runtime `do_command` keys
+
+Each command takes a single-key payload whose value is an object. The object may contain an `enabled` boolean plus any of the filter's tuning fields. Tuning fields update the live filter object **in place** so accumulated state (temporal IIR history, etc.) is preserved. Setting `enabled: false` clears that filter's state so re-enabling starts fresh.
+
+| Command | Value | Description |
+| ------- | ----- | ----------- |
+| `set_decimation_filter` | `{enabled?, magnitude?}` | Toggle / retune decimation. |
+| `set_depth_clip_distance` | `{enabled?, min_m?, max_m?}` | Toggle / retune the threshold-based depth clip. |
+| `set_spatial_filter` | `{enabled?, magnitude?, smooth_alpha?, smooth_delta?, hole_fill?}` | Toggle / retune spatial smoothing. |
+| `set_temporal_filter` | `{enabled?, smooth_alpha?, smooth_delta?, persistence?}` | Toggle / retune temporal smoothing. |
+| `set_hole_filling_filter` | `{enabled?, mode?}` | Toggle / retune hole filling. |
+| `get_filter_options` | any | Return the current per-filter state. |
+
+> [!NOTE]
+> Runtime `set_*_filter` calls are **not persisted**: the next reconfigure (or pipeline restart) rebuilds the chain from the resource config. To make a change permanent, also update the matching attribute on the component.
+
+#### Example using Python SDK
+
+```python
+# Enable temporal smoothing at runtime, then retune without losing state
+await camera.do_command({"set_temporal_filter": {"enabled": True, "smooth_alpha": 0.4}})
+await camera.do_command({"set_temporal_filter": {"smooth_alpha": 0.6}})  # no enabled key
+
+# Clip depth to a working volume
+await camera.do_command({"set_depth_clip_distance": {"enabled": True, "min_m": 0.5, "max_m": 1.5}})
+
+# Read back the current chain state
+await camera.do_command({"get_filter_options": ""})
+```
+
+#### A note on `hole_filling_filter`
+
+`hole_filling_filter` **fabricates depth values** for missing pixels by extrapolating from spatial neighbours. The output looks dense but those pixels are not measurements:
+
+- It destroys the "invalid pixel" signal (zero depth = "couldn't measure here") that downstream consumers may use to reject untrustworthy regions.
+- Filled values can shift object silhouettes by tens of millimetres at depth discontinuities — bad for pick-and-place or pose estimation.
+- It applies after `temporal_filter` in the recommended order; filled pixels jitter frame-to-frame independently of the temporally-smoothed valid pixels.
+
+Use it only when the downstream consumer wants a dense image regardless of accuracy (visualisation, or a neural net trained on filled depth). For anything quantitative, prefer to leave it off.
 
 ### Locally install the module
 

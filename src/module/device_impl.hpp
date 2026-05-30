@@ -614,6 +614,7 @@ bool destroyDevice(std::shared_ptr<boost::synchronized_value<ViamDeviceT>> &dev,
       device->config.reset();
       device->align.reset();
       device->point_cloud_filter.reset();
+      device->depth_filter_chain.reset();
 
       VIAM_DEVICE_LOG(logger, info)
           << "[destroyDevice] device destroyed: " << device->serial_number;
@@ -689,6 +690,7 @@ createDevice(std::string const &serial_number, std::shared_ptr<DeviceT> dev,
   my_dev->device = dev;
   my_dev->serial_number = serial_number;
   my_dev->point_cloud_filter = std::make_shared<PointCloudFilter>();
+  my_dev->depth_filter_chain = std::make_shared<DepthFilterChain>(viamConfig);
   my_dev->align = std::make_shared<std::decay_t<decltype(*my_dev->align)>>(
       RS2_STREAM_COLOR);
   my_dev->config = config;
@@ -764,6 +766,10 @@ void reconfigureDevice(
     }
 
     device_guard->config = new_config;
+    // Rebuild the depth filter chain from the new config — runtime overrides
+    // from set_*_filter do_commands are intentionally discarded; config wins.
+    device_guard->depth_filter_chain =
+        std::make_shared<DepthFilterChain>(viamConfig);
     VIAM_DEVICE_LOG(logger, info) << "[reconfigureDevice] device reconfigured";
   } // End scope for device_guard lock
 }

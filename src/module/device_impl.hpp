@@ -200,6 +200,106 @@ viam::sdk::ProtoStruct readAdvancedDepthControl(DeviceT &dev,
   return r;
 }
 
+// Apply HDR config to the depth sensor. librealsense's HDR cycles through
+// SEQUENCE_SIZE sub-exposures by toggling RS2_OPTION_SEQUENCE_ID and
+// writing per-sub-exposure EXPOSURE / GAIN. Then HDR_ENABLED flips the
+// whole thing on (or off).
+template <typename SensorT>
+std::string applyHdrConfig(SensorT &sensor, HdrConfig const &cfg,
+                           viam::sdk::LogSource &logger) {
+  auto safe_set_named = [&](rs2_option opt, double v,
+                            char const *name) -> std::string {
+    if (not sensor.supports(opt)) {
+      return std::string("sensor does not support ") + name;
+    }
+    try {
+      sensor.set_option(opt, static_cast<float>(v));
+      return {};
+    } catch (std::exception const &e) {
+      return e.what();
+    }
+  };
+
+  // Pick the per-sub-exposure SEQUENCE_ID before each EXPOSURE / GAIN
+  // write so the value lands on the correct sub-exposure slot.
+  auto write_sub = [&](double seq_id, std::optional<double> exposure,
+                       std::optional<double> gain,
+                       char const *label) -> std::string {
+    if (not exposure and not gain) return {};
+    auto err = safe_set_named(RS2_OPTION_SEQUENCE_ID, seq_id, "sequence_id");
+    if (not err.empty()) return std::string("sub-") + label + ": " + err;
+    if (exposure) {
+      err = safe_set_named(RS2_OPTION_EXPOSURE, *exposure, "exposure");
+      if (not err.empty())
+        return std::string("sub-") + label + ".exposure: " + err;
+    }
+    if (gain) {
+      err = safe_set_named(RS2_OPTION_GAIN, *gain, "gain");
+      if (not err.empty())
+        return std::string("sub-") + label + ".gain: " + err;
+    }
+    return {};
+  };
+
+  // SEQUENCE_SIZE is fixed at 2 for D435 HDR. Set it explicitly so we
+  // don't depend on whatever the firmware was last left in.
+  if (sensor.supports(RS2_OPTION_SEQUENCE_SIZE)) {
+    try {
+      sensor.set_option(RS2_OPTION_SEQUENCE_SIZE, 2.0f);
+    } catch (std::exception const &e) {
+      VIAM_DEVICE_LOG(logger, warn)
+          << "[applyHdrConfig] set sequence_size failed: " << e.what();
+    }
+  }
+  auto e = write_sub(1.0, cfg.exposure_short_us, cfg.gain_short, "short");
+  if (not e.empty()) return e;
+  e = write_sub(2.0, cfg.exposure_long_us, cfg.gain_long, "long");
+  if (not e.empty()) return e;
+
+  if (cfg.enabled) {
+    auto err =
+        safe_set_named(RS2_OPTION_HDR_ENABLED,
+                       *cfg.enabled ? 1.0 : 0.0, "hdr_enabled");
+    if (not err.empty()) return err;
+  }
+  return {};
+}
+
+// Read the current HDR state from the depth sensor into a ProtoStruct
+// suitable for the get_hdr response. Includes the device-reported support
+// flag so callers can detect cameras without HDR.
+template <typename SensorT>
+viam::sdk::ProtoStruct readHdrConfig(SensorT &sensor) {
+  viam::sdk::ProtoStruct out;
+  auto opt = [&](char const *k, rs2_option o) {
+    if (sensor.supports(o)) {
+      try {
+        out[k] = static_cast<double>(sensor.get_option(o));
+      } catch (...) {
+      }
+    }
+  };
+  out["supported"] = sensor.supports(RS2_OPTION_HDR_ENABLED);
+  opt("enabled", RS2_OPTION_HDR_ENABLED);
+  opt("sequence_size", RS2_OPTION_SEQUENCE_SIZE);
+  // Read the two sub-exposures by toggling SEQUENCE_ID. Wrapped in
+  // try/catch because the toggle may itself throw on some firmwares.
+  auto read_sub = [&](double seq_id, char const *exposure_k,
+                      char const *gain_k) {
+    try {
+      sensor.set_option(RS2_OPTION_SEQUENCE_ID,
+                        static_cast<float>(seq_id));
+    } catch (...) {
+      return;
+    }
+    opt(exposure_k, RS2_OPTION_EXPOSURE);
+    opt(gain_k, RS2_OPTION_GAIN);
+  };
+  read_sub(1.0, "exposure_short_us", "gain_short");
+  read_sub(2.0, "exposure_long_us", "gain_long");
+  return out;
+}
+
 // Apply an auto-exposure ROI rectangle to the depth sensor. Wraps
 // rs2::roi_sensor::set_region_of_interest. Returns an empty string on
 // success, or a diagnostic if the cast / call fails.
@@ -290,6 +390,23 @@ void applyDepthSensorOptions(SensorT &sensor, ViamConfigT const &viamConfig,
   if (viamConfig.laser_power) {
     safe_set(RS2_OPTION_LASER_POWER, *viamConfig.laser_power, "laser_power");
   }
+  if (viamConfig.hdr) {
+    if (viamConfig.depth_exposure_us or viamConfig.depth_auto_exposure) {
+      VIAM_DEVICE_LOG(logger, warn)
+          << "[applyDepthSensorOptions] hdr is set alongside depth_exposure_us "
+             "or depth_auto_exposure; HDR will override single-exposure "
+             "settings";
+    }
+    auto err = applyHdrConfig(sensor, *viamConfig.hdr, logger);
+    if (not err.empty()) {
+      VIAM_DEVICE_LOG(logger, warn)
+          << "[applyDepthSensorOptions] hdr: " << err;
+    } else {
+      VIAM_DEVICE_LOG(logger, info)
+          << "[applyDepthSensorOptions] HDR applied";
+    }
+  }
+
   // ROI requires rs2::roi_sensor — gated at compile time to avoid forcing
   // mock sensor types in unit tests to implement the rs2 cast machinery.
   if constexpr (std::is_same_v<SensorT, rs2::depth_sensor>) {

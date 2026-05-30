@@ -79,6 +79,9 @@ enum class DoCommand : uint8_t {
   ENABLE_ADVANCED_MODE,
   SET_ADVANCED_DEPTH_CONTROL,
   GET_ADVANCED_DEPTH_CONTROL,
+  // Hardware HDR (single interleaved depth stream, two sub-exposures).
+  SET_HDR,
+  GET_HDR,
   UNKNOWN = std::numeric_limits<uint8_t>::max()
 };
 
@@ -133,6 +136,8 @@ static const std::unordered_map<std::string, uint8_t> DoCommandMap{
       static_cast<uint8_t>(DoCommand::SET_ADVANCED_DEPTH_CONTROL)},
      {"get_advanced_depth_control",
       static_cast<uint8_t>(DoCommand::GET_ADVANCED_DEPTH_CONTROL)},
+     {"set_hdr", static_cast<uint8_t>(DoCommand::SET_HDR)},
+     {"get_hdr", static_cast<uint8_t>(DoCommand::GET_HDR)},
      {"unknown", static_cast<uint8_t>(DoCommand::UNKNOWN)}}};
 
 const std::string service_name = "viam_realsense";
@@ -256,6 +261,11 @@ struct RsResourceConfig {
   // Per-pixel stereo matcher tuning via rs400::advanced_mode. Only applied
   // if advanced_mode is enabled (either via this config or already on).
   std::optional<device::AdvancedDepthControl> advanced_depth_control{};
+
+  // Hardware HDR on the depth sensor (D435/D435i). Cycles between two
+  // sub-exposures every other frame so consumers see a single interleaved
+  // depth stream.
+  std::optional<device::HdrConfig> hdr{};
 
   // Per-stream resolution / fps. When set, override the top-level
   // width/height fallback for that stream. Both unset → today's behaviour
@@ -983,6 +993,57 @@ public:
           }
         }
         r["frames_available"] = have_frameset;
+        return r;
+      }
+      case DoCommand::SET_HDR: {
+        auto const &val = command.begin()->second;
+        if (not val.is_a<viam::sdk::ProtoStruct>()) {
+          viam::sdk::ProtoStruct r;
+          r["success"] = false;
+          r["error"] = "set_hdr expects an object";
+          return r;
+        }
+        auto const &params = val.get_unchecked<viam::sdk::ProtoStruct>();
+        auto opt_bool = [&](char const *k) -> std::optional<bool> {
+          auto it = params.find(k);
+          if (it == params.end()) return std::nullopt;
+          viam::sdk::ProtoValue const &pv = it->second;
+          if (not pv.is_a<bool>()) return std::nullopt;
+          return pv.get_unchecked<bool>();
+        };
+        auto opt_num = [&](char const *k) -> std::optional<double> {
+          auto it = params.find(k);
+          if (it == params.end()) return std::nullopt;
+          viam::sdk::ProtoValue const &pv = it->second;
+          if (not pv.is_a<double>()) return std::nullopt;
+          return pv.get_unchecked<double>();
+        };
+        device::HdrConfig hcfg{
+            opt_bool("enabled"), opt_num("exposure_short_us"),
+            opt_num("exposure_long_us"), opt_num("gain_short"),
+            opt_num("gain_long")};
+        viam::sdk::ProtoStruct response;
+        bool sensor_present =
+            withDepthSensor([&](rs2::depth_sensor &ds) {
+              auto e = device::applyHdrConfig(ds, hcfg, this->logger_);
+              if (e.empty()) {
+                response["success"] = true;
+              } else {
+                response["success"] = false;
+                response["error"] = e;
+              }
+            });
+        if (not sensor_present) {
+          response["success"] = false;
+          response["error"] = "no live depth sensor available";
+        }
+        return response;
+      }
+      case DoCommand::GET_HDR: {
+        viam::sdk::ProtoStruct r;
+        bool sensor_present = withDepthSensor(
+            [&](rs2::depth_sensor &ds) { r = device::readHdrConfig(ds); });
+        r["sensor_present"] = sensor_present;
         return r;
       }
       case DoCommand::ENABLE_ADVANCED_MODE: {
@@ -1791,6 +1852,51 @@ public:
         not attrs["advanced_mode"].is_a<bool>()) {
       throw std::invalid_argument("advanced_mode must be a bool");
     }
+
+    if (attrs.count("hdr")) {
+      if (not attrs["hdr"].is_a<viam::sdk::ProtoStruct>()) {
+        throw std::invalid_argument("hdr must be an object");
+      }
+      auto const &sub = attrs["hdr"].get_unchecked<viam::sdk::ProtoStruct>();
+      static constexpr char const *kHdrKeys[] = {
+          "enabled", "exposure_short_us", "exposure_long_us", "gain_short",
+          "gain_long"};
+      for (auto const &pair : sub) {
+        bool ok = false;
+        for (auto const *a : kHdrKeys) {
+          if (pair.first == a) {
+            ok = true;
+            break;
+          }
+        }
+        if (not ok) {
+          throw std::invalid_argument(
+              std::string("hdr: unknown key \"") + pair.first + "\"");
+        }
+      }
+      auto it_en = sub.find("enabled");
+      if (it_en != sub.end() and not it_en->second.is_a<bool>()) {
+        throw std::invalid_argument("hdr.enabled must be a bool");
+      }
+      auto check_num = [&](char const *k, double lo, double hi) {
+        auto it = sub.find(k);
+        if (it == sub.end()) return;
+        viam::sdk::ProtoValue const &pv = it->second;
+        if (not pv.is_a<double>()) {
+          throw std::invalid_argument(std::string("hdr.") + k +
+                                      " must be a number");
+        }
+        double d = pv.get_unchecked<double>();
+        if (d < lo or d > hi) {
+          throw std::invalid_argument(std::string("hdr.") + k +
+                                      " out of range");
+        }
+      };
+      check_num("exposure_short_us", 1, 200000);
+      check_num("exposure_long_us", 1, 200000);
+      check_num("gain_short", 0, 248);
+      check_num("gain_long", 0, 248);
+    }
     if (attrs.count("advanced_depth_control")) {
       if (not attrs["advanced_depth_control"].is_a<viam::sdk::ProtoStruct>()) {
         throw std::invalid_argument(
@@ -2574,6 +2680,23 @@ private:
     if (attrs.count("advanced_mode")) {
       native_config.advanced_mode =
           attrs["advanced_mode"].get_unchecked<bool>();
+    }
+    if (attrs.count("hdr")) {
+      auto const &sub = attrs["hdr"].get_unchecked<viam::sdk::ProtoStruct>();
+      auto opt_bool = [&](char const *k) -> std::optional<bool> {
+        auto it = sub.find(k);
+        if (it == sub.end()) return std::nullopt;
+        return it->second.get_unchecked<bool>();
+      };
+      auto opt_num = [&](char const *k) -> std::optional<double> {
+        auto it = sub.find(k);
+        if (it == sub.end()) return std::nullopt;
+        return it->second.get_unchecked<double>();
+      };
+      native_config.hdr = device::HdrConfig{
+          opt_bool("enabled"), opt_num("exposure_short_us"),
+          opt_num("exposure_long_us"), opt_num("gain_short"),
+          opt_num("gain_long")};
     }
     if (attrs.count("advanced_depth_control")) {
       auto const &sub = attrs["advanced_depth_control"]

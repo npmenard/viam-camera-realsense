@@ -39,6 +39,19 @@ struct DepthAeRoi {
   int max_y{0};
 };
 
+// Hardware HDR on the depth sensor. The D435/D435i can alternate between
+// two depth sub-exposures every other frame; consumers see a single depth
+// stream whose frames flicker between the two settings, effectively
+// extending dynamic range without exposing sequence IDs in the SDK
+// (response_metadata has no slot for them).
+struct HdrConfig {
+  std::optional<bool> enabled{};
+  std::optional<double> exposure_short_us{}; // 1..200000
+  std::optional<double> exposure_long_us{};  // 1..200000
+  std::optional<double> gain_short{};        // 0..248
+  std::optional<double> gain_long{};         // 0..248
+};
+
 // rs400 advanced-mode depth control group fields. Each is optional so
 // set_advanced_depth_control does a read-modify-write — fields the caller
 // didn't supply keep their current value.

@@ -78,6 +78,56 @@ visualPresetToString(rs2_rs400_visual_preset preset) {
   return std::nullopt;
 }
 
+// Emitter pattern modes mapped to the rs2_options they need to set. Each
+// entry is the full set of writes for that mode — superset of the simpler
+// depth_emitter_enabled bool. Source of truth shared between the config
+// path (applyEmitterPattern) and validate().
+inline constexpr std::array<std::string_view, 3> kEmitterPatternNames{
+    {"off", "always_on", "alternate"}};
+
+inline bool isValidEmitterPattern(std::string const &mode) {
+  for (auto const &n : kEmitterPatternNames) {
+    if (mode == n) {
+      return true;
+    }
+  }
+  return false;
+}
+
+template <typename SensorT>
+void applyEmitterPattern(SensorT &sensor, std::string const &mode,
+                         viam::sdk::LogSource &logger) {
+  auto safe_set = [&](rs2_option opt, double value, char const *name) {
+    if (not sensor.supports(opt)) {
+      VIAM_DEVICE_LOG(logger, warn)
+          << "[applyEmitterPattern] sensor does not support " << name;
+      return;
+    }
+    try {
+      sensor.set_option(opt, static_cast<float>(value));
+      VIAM_DEVICE_LOG(logger, info)
+          << "[applyEmitterPattern] set " << name << "=" << value;
+    } catch (std::exception const &e) {
+      VIAM_DEVICE_LOG(logger, error)
+          << "[applyEmitterPattern] failed to set " << name << ": "
+          << e.what();
+    }
+  };
+
+  if (mode == "off") {
+    safe_set(RS2_OPTION_EMITTER_ENABLED, 0.0, "emitter_enabled");
+  } else if (mode == "always_on") {
+    safe_set(RS2_OPTION_EMITTER_ENABLED, 1.0, "emitter_enabled");
+    safe_set(RS2_OPTION_EMITTER_ALWAYS_ON, 1.0, "emitter_always_on");
+  } else if (mode == "alternate") {
+    safe_set(RS2_OPTION_EMITTER_ENABLED, 1.0, "emitter_enabled");
+    safe_set(RS2_OPTION_EMITTER_ON_OFF, 1.0, "emitter_on_off");
+  } else {
+    VIAM_DEVICE_LOG(logger, warn)
+        << "[applyEmitterPattern] unknown emitter_pattern \"" << mode << "\"";
+  }
+}
+
 // Apply user-supplied depth sensor knobs (visual preset, laser power, emitter,
 // exposure, gain) before the pipeline starts. Each option is guarded by
 // supports(); unsupported ones are logged and skipped rather than aborting.
@@ -132,9 +182,17 @@ void applyDepthSensorOptions(SensorT &sensor, ViamConfigT const &viamConfig,
   if (viamConfig.depth_gain) {
     safe_set(RS2_OPTION_GAIN, *viamConfig.depth_gain, "gain");
   }
+  if (viamConfig.depth_emitter_enabled and viamConfig.emitter_pattern) {
+    VIAM_DEVICE_LOG(logger, warn)
+        << "[applyDepthSensorOptions] both depth_emitter_enabled and "
+           "emitter_pattern are set; emitter_pattern wins";
+  }
   if (viamConfig.depth_emitter_enabled) {
     safe_set(RS2_OPTION_EMITTER_ENABLED,
              *viamConfig.depth_emitter_enabled ? 1.0 : 0.0, "emitter_enabled");
+  }
+  if (viamConfig.emitter_pattern) {
+    applyEmitterPattern(sensor, *viamConfig.emitter_pattern, logger);
   }
   if (viamConfig.laser_power) {
     safe_set(RS2_OPTION_LASER_POWER, *viamConfig.laser_power, "laser_power");

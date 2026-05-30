@@ -1517,6 +1517,75 @@ TEST_F(DeviceTest, ApplyColorSensorOptions_UnsupportedOption_LogsAndSkips) {
   EXPECT_TRUE(found_warn) << "Should log a warning for unsupported gain";
 }
 
+TEST_F(DeviceTest, IsValidEmitterPattern_AcceptsKnownAndRejectsUnknown) {
+  EXPECT_TRUE(isValidEmitterPattern("off"));
+  EXPECT_TRUE(isValidEmitterPattern("always_on"));
+  EXPECT_TRUE(isValidEmitterPattern("alternate"));
+  EXPECT_FALSE(isValidEmitterPattern("on"));
+  EXPECT_FALSE(isValidEmitterPattern(""));
+  EXPECT_FALSE(isValidEmitterPattern("alternating"));
+}
+
+TEST_F(DeviceTest, ApplyEmitterPattern_AlwaysOn_WritesBothFlags) {
+  test_utils::LogCaptureFixture log_capture;
+  viam::sdk::LogSource logger;
+  SimpleSensor depth_sensor;
+  depth_sensor.set_sensor_type(false, true);
+
+  EXPECT_CALL(*depth_sensor.mock(), supports(RS2_OPTION_EMITTER_ENABLED))
+      .Times(1)
+      .WillOnce(Return(true));
+  EXPECT_CALL(*depth_sensor.mock(),
+              set_option(RS2_OPTION_EMITTER_ENABLED, 1.0f))
+      .Times(1);
+  EXPECT_CALL(*depth_sensor.mock(), supports(RS2_OPTION_EMITTER_ALWAYS_ON))
+      .Times(1)
+      .WillOnce(Return(true));
+  EXPECT_CALL(*depth_sensor.mock(),
+              set_option(RS2_OPTION_EMITTER_ALWAYS_ON, 1.0f))
+      .Times(1);
+
+  applyEmitterPattern(depth_sensor, "always_on", logger);
+}
+
+TEST_F(DeviceTest, ApplyEmitterPattern_Alternate_WritesEnabledAndOnOff) {
+  test_utils::LogCaptureFixture log_capture;
+  viam::sdk::LogSource logger;
+  SimpleSensor depth_sensor;
+  depth_sensor.set_sensor_type(false, true);
+
+  EXPECT_CALL(*depth_sensor.mock(), supports(RS2_OPTION_EMITTER_ENABLED))
+      .Times(1)
+      .WillOnce(Return(true));
+  EXPECT_CALL(*depth_sensor.mock(),
+              set_option(RS2_OPTION_EMITTER_ENABLED, 1.0f))
+      .Times(1);
+  EXPECT_CALL(*depth_sensor.mock(), supports(RS2_OPTION_EMITTER_ON_OFF))
+      .Times(1)
+      .WillOnce(Return(true));
+  EXPECT_CALL(*depth_sensor.mock(),
+              set_option(RS2_OPTION_EMITTER_ON_OFF, 1.0f))
+      .Times(1);
+
+  applyEmitterPattern(depth_sensor, "alternate", logger);
+}
+
+TEST_F(DeviceTest, ApplyEmitterPattern_Off_DisablesEmitter) {
+  test_utils::LogCaptureFixture log_capture;
+  viam::sdk::LogSource logger;
+  SimpleSensor depth_sensor;
+  depth_sensor.set_sensor_type(false, true);
+
+  EXPECT_CALL(*depth_sensor.mock(), supports(RS2_OPTION_EMITTER_ENABLED))
+      .Times(1)
+      .WillOnce(Return(true));
+  EXPECT_CALL(*depth_sensor.mock(),
+              set_option(RS2_OPTION_EMITTER_ENABLED, 0.0f))
+      .Times(1);
+
+  applyEmitterPattern(depth_sensor, "off", logger);
+}
+
 TEST_F(DeviceTest, StreamConfig_DefaultConstructedIsZeroed) {
   StreamConfig sc{};
   EXPECT_EQ(sc.width_px, 0);

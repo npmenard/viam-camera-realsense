@@ -69,6 +69,8 @@ enum class DoCommand : uint8_t {
   SET_DEPTH_STREAM, // {width_px, height_px, fps}
   SET_COLOR_STREAM, // {width_px, height_px, fps}
   GET_STREAM_CONFIG, // no payload (any value) — returns active stream profiles
+  // Emitter pattern: "off" | "always_on" | "alternate".
+  SET_EMITTER_PATTERN,
   UNKNOWN = std::numeric_limits<uint8_t>::max()
 };
 
@@ -111,6 +113,8 @@ static const std::unordered_map<std::string, uint8_t> DoCommandMap{
       static_cast<uint8_t>(DoCommand::SET_COLOR_STREAM)},
      {"get_stream_config",
       static_cast<uint8_t>(DoCommand::GET_STREAM_CONFIG)},
+     {"set_emitter_pattern",
+      static_cast<uint8_t>(DoCommand::SET_EMITTER_PATTERN)},
      {"unknown", static_cast<uint8_t>(DoCommand::UNKNOWN)}}};
 
 const std::string service_name = "viam_realsense";
@@ -219,6 +223,10 @@ struct RsResourceConfig {
   std::optional<double> depth_exposure_us{};
   std::optional<bool> depth_auto_exposure{};
   std::optional<double> depth_gain{};
+
+  // Depth emitter pattern. Overrides depth_emitter_enabled when both are
+  // set. Valid values: "off" | "always_on" | "alternate".
+  std::optional<std::string> emitter_pattern{};
 
   // Per-stream resolution / fps. When set, override the top-level
   // width/height fallback for that stream. Both unset → today's behaviour
@@ -933,6 +941,33 @@ public:
         r["frames_available"] = have_frameset;
         return r;
       }
+      case DoCommand::SET_EMITTER_PATTERN: {
+        auto v = extractArg<std::string>(command, "set_emitter_pattern",
+                                         "a string", err);
+        if (not v) return err;
+        if (not device::isValidEmitterPattern(*v)) {
+          err["success"] = false;
+          err["error"] = std::string("unknown emitter_pattern: ") + *v;
+          return err;
+        }
+        viam::sdk::ProtoStruct response;
+        bool sensor_present =
+            withDepthSensor([&](rs2::depth_sensor &ds) {
+              try {
+                device::applyEmitterPattern(ds, *v, this->logger_);
+                response["success"] = true;
+                response["mode"] = *v;
+              } catch (std::exception const &e) {
+                response["success"] = false;
+                response["error"] = std::string(e.what());
+              }
+            });
+        if (not sensor_present) {
+          response["success"] = false;
+          response["error"] = "no live depth sensor available";
+        }
+        return response;
+      }
       case DoCommand::GET_COLOR_OPTIONS: {
         viam::sdk::ProtoStruct r;
         bool sensor_present = withColorSensor([&](rs2::color_sensor &cs) {
@@ -1538,6 +1573,17 @@ public:
       double g = attrs["depth_gain"].get_unchecked<double>();
       if (g < 0 or g > 248) {
         throw std::invalid_argument("depth_gain must be in [0, 248]");
+      }
+    }
+
+    if (attrs.count("emitter_pattern")) {
+      if (not attrs["emitter_pattern"].is_a<std::string>()) {
+        throw std::invalid_argument("emitter_pattern must be a string");
+      }
+      std::string mode = attrs["emitter_pattern"].get_unchecked<std::string>();
+      if (not device::isValidEmitterPattern(mode)) {
+        throw std::invalid_argument(
+            "emitter_pattern must be one of: off, always_on, alternate");
       }
     }
 
@@ -2233,6 +2279,10 @@ private:
     }
     if (attrs.count("depth_gain")) {
       native_config.depth_gain = attrs["depth_gain"].get_unchecked<double>();
+    }
+    if (attrs.count("emitter_pattern")) {
+      native_config.emitter_pattern =
+          attrs["emitter_pattern"].get_unchecked<std::string>();
     }
 
     if (attrs.count("color_auto_exposure")) {

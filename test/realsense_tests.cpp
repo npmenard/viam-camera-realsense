@@ -799,6 +799,79 @@ TEST_F(RealsenseTest, FirmwareUpdate_AutoDetect_Outdated_StopsDevice) {
 #endif
 }
 
+// -------- do_command argument-validation rejection tests --------
+// These call the extracted static validators directly with sub-struct
+// payloads mirroring the shape of DoCommand arguments. Every helper is
+// shared with config-time validate(); a failure here means both paths are
+// broken.
+using R = Realsense<SimpleMockContext>;
+
+TEST(DoCommandValidation, HdrRejectsOutOfRange) {
+  ProtoStruct sub;
+  sub["exposure_short_us"] = 999999.0;
+  EXPECT_THROW(R::validateHdrParams(sub), std::invalid_argument);
+}
+
+TEST(DoCommandValidation, HdrRejectsUnknownKey) {
+  ProtoStruct sub;
+  sub["typo_key"] = 1.0;
+  EXPECT_THROW(R::validateHdrParams(sub), std::invalid_argument);
+}
+
+TEST(DoCommandValidation, AdvancedDepthControlRejectsWrongType) {
+  ProtoStruct sub;
+  sub["texture_count_threshold"] = std::string("nope");
+  EXPECT_THROW(R::validateAdvancedDepthControlParams(sub),
+               std::invalid_argument);
+}
+
+TEST(DoCommandValidation, DepthAeRoiRejectsMissingField) {
+  ProtoStruct sub;
+  sub["min_x"] = 0.0;
+  sub["min_y"] = 0.0;
+  sub["max_x"] = 100.0; // max_y missing
+  EXPECT_THROW(R::validateDepthAeRoiParams(sub), std::invalid_argument);
+}
+
+TEST(DoCommandValidation, DepthAeRoiRejectsInvertedBox) {
+  ProtoStruct sub;
+  sub["min_x"] = 100.0;
+  sub["min_y"] = 100.0;
+  sub["max_x"] = 50.0;
+  sub["max_y"] = 50.0;
+  EXPECT_THROW(R::validateDepthAeRoiParams(sub), std::invalid_argument);
+}
+
+TEST(DoCommandValidation, StreamBlockRejectsBadFps) {
+  ProtoStruct sub;
+  sub["width_px"] = 640.0;
+  sub["height_px"] = 480.0;
+  sub["fps"] = 42.0;
+  EXPECT_THROW(R::validateStreamBlockParams(sub, "set_depth_stream"),
+               std::invalid_argument);
+}
+
+TEST(DoCommandValidation, FilterBlockRejectsBadMagnitude) {
+  ProtoStruct sub;
+  sub["enabled"] = true;
+  sub["magnitude"] = 99.0; // decimation range is 2..8
+  EXPECT_THROW(R::validateFilterBlockParams(sub, "decimation_filter", true),
+               std::invalid_argument);
+}
+
+TEST(DoCommandValidation, FilterBlockRejectsUnknownKey) {
+  ProtoStruct sub;
+  sub["bogus"] = 1.0;
+  EXPECT_THROW(R::validateFilterBlockParams(sub, "spatial_filter", true),
+               std::invalid_argument);
+}
+
+TEST(DoCommandValidation, ColorWhiteBalanceRejectsBadKelvin) {
+  ProtoStruct sub;
+  sub["kelvin"] = 100.0; // range is [2800, 6500]
+  EXPECT_THROW(R::validateColorWhiteBalanceParams(sub), std::invalid_argument);
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   ::testing::AddGlobalTestEnvironment(new RealsenseTestEnvironment);

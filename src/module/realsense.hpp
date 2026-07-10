@@ -733,6 +733,21 @@ public:
     VIAM_RESOURCE_LOG(info) << "[do_command] Lock acquired, processing command";
     DoCommand do_command = get_do_command(command);
 
+    // Reject malformed multi-field payloads up-front, reusing the same
+    // range/type/unknown-key checks as the config validator. Single-scalar
+    // setters are left to librealsense (which knows the true per-SKU
+    // ranges) — see extractArg for their type gate.
+    try {
+      validateDoCommandArgs(command, do_command);
+    } catch (std::invalid_argument const &e) {
+      viam::sdk::ProtoStruct response;
+      response["success"] = false;
+      response["error"] = std::string(e.what());
+      VIAM_RESOURCE_LOG(error)
+          << "[do_command] Argument validation failed: " << e.what();
+      return response;
+    }
+
     try {
       // Runtime depth-sensor tuning commands. Each is a single-key payload.
       viam::sdk::ProtoStruct err;
@@ -1857,132 +1872,26 @@ public:
       if (not attrs["hdr"].is_a<viam::sdk::ProtoStruct>()) {
         throw std::invalid_argument("hdr must be an object");
       }
-      auto const &sub = attrs["hdr"].get_unchecked<viam::sdk::ProtoStruct>();
-      static constexpr char const *kHdrKeys[] = {
-          "enabled", "exposure_short_us", "exposure_long_us", "gain_short",
-          "gain_long"};
-      for (auto const &pair : sub) {
-        bool ok = false;
-        for (auto const *a : kHdrKeys) {
-          if (pair.first == a) {
-            ok = true;
-            break;
-          }
-        }
-        if (not ok) {
-          throw std::invalid_argument(
-              std::string("hdr: unknown key \"") + pair.first + "\"");
-        }
-      }
-      auto it_en = sub.find("enabled");
-      if (it_en != sub.end() and not it_en->second.is_a<bool>()) {
-        throw std::invalid_argument("hdr.enabled must be a bool");
-      }
-      auto check_num = [&](char const *k, double lo, double hi) {
-        auto it = sub.find(k);
-        if (it == sub.end()) return;
-        viam::sdk::ProtoValue const &pv = it->second;
-        if (not pv.is_a<double>()) {
-          throw std::invalid_argument(std::string("hdr.") + k +
-                                      " must be a number");
-        }
-        double d = pv.get_unchecked<double>();
-        if (d < lo or d > hi) {
-          throw std::invalid_argument(std::string("hdr.") + k +
-                                      " out of range");
-        }
-      };
-      check_num("exposure_short_us", 1, 200000);
-      check_num("exposure_long_us", 1, 200000);
-      check_num("gain_short", 0, 248);
-      check_num("gain_long", 0, 248);
+      validateHdrParams(attrs["hdr"].get_unchecked<viam::sdk::ProtoStruct>());
     }
     if (attrs.count("advanced_depth_control")) {
       if (not attrs["advanced_depth_control"].is_a<viam::sdk::ProtoStruct>()) {
         throw std::invalid_argument(
             "advanced_depth_control must be an object");
       }
-      auto const &sub = attrs["advanced_depth_control"]
-                            .get_unchecked<viam::sdk::ProtoStruct>();
-      static constexpr char const *kAllowed[] = {
-          "texture_count_threshold",      "texture_difference_threshold",
-          "score_threshold_a",            "score_threshold_b",
-          "lr_agree_threshold",           "median_threshold",
-          "neighbor_threshold"};
-      for (auto const &[k, _] : sub) {
-        bool ok = false;
-        for (auto const *a : kAllowed) {
-          if (k == a) {
-            ok = true;
-            break;
-          }
-        }
-        if (not ok) {
-          throw std::invalid_argument(
-              std::string("advanced_depth_control: unknown key \"") + k +
-              "\"");
-        }
-      }
-      for (auto const &pair : sub) {
-        viam::sdk::ProtoValue const &v_proto = pair.second;
-        if (not v_proto.is_a<double>()) {
-          throw std::invalid_argument(
-              std::string("advanced_depth_control.") + pair.first +
-              " must be a number");
-        }
-        double d = v_proto.get_unchecked<double>();
-        if (d < 0) {
-          throw std::invalid_argument(
-              std::string("advanced_depth_control.") + pair.first +
-              " must be >= 0");
-        }
-      }
+      validateAdvancedDepthControlParams(
+          attrs["advanced_depth_control"]
+              .get_unchecked<viam::sdk::ProtoStruct>());
     }
 
     if (attrs.count("depth_ae_roi")) {
       if (not attrs["depth_ae_roi"].is_a<viam::sdk::ProtoStruct>()) {
         throw std::invalid_argument("depth_ae_roi must be an object");
       }
-      auto const &sub =
-          attrs["depth_ae_roi"].get_unchecked<viam::sdk::ProtoStruct>();
-      for (auto const &[k, _] : sub) {
-        if (k != "min_x" and k != "min_y" and k != "max_x" and k != "max_y") {
-          throw std::invalid_argument(
-              std::string("depth_ae_roi: unknown key \"") + k + "\"");
-        }
-      }
-      int min_x = 0, min_y = 0, max_x = 0, max_y = 0;
-      for (auto const &k : {"min_x", "min_y", "max_x", "max_y"}) {
-        auto it = sub.find(k);
-        if (it == sub.end()) {
-          throw std::invalid_argument(std::string("depth_ae_roi.") + k +
-                                      " is required");
-        }
-        viam::sdk::ProtoValue const &pv = it->second;
-        if (not pv.is_a<double>()) {
-          throw std::invalid_argument(std::string("depth_ae_roi.") + k +
-                                      " must be a number");
-        }
-        double d = pv.get_unchecked<double>();
-        if (d < 0) {
-          throw std::invalid_argument(std::string("depth_ae_roi.") + k +
-                                      " must be >= 0");
-        }
-        int v = static_cast<int>(d);
-        if (std::string(k) == "min_x") min_x = v;
-        else if (std::string(k) == "min_y") min_y = v;
-        else if (std::string(k) == "max_x") max_x = v;
-        else if (std::string(k) == "max_y") max_y = v;
-      }
-      if (min_x >= max_x or min_y >= max_y) {
-        throw std::invalid_argument(
-            "depth_ae_roi: min_x < max_x and min_y < max_y required");
-      }
+      validateDepthAeRoiParams(
+          attrs["depth_ae_roi"].get_unchecked<viam::sdk::ProtoStruct>());
     }
 
-    // Per-stream resolution / fps validation. width/height positive ints,
-    // fps in the librealsense-supported set. Unknown sub-keys rejected.
-    static constexpr int kAllowedFps[] = {6, 15, 30, 60, 90};
     auto validateStreamBlock = [&](char const *name) {
       if (not attrs.count(name)) {
         return;
@@ -1990,43 +1899,8 @@ public:
       if (not attrs[name].is_a<viam::sdk::ProtoStruct>()) {
         throw std::invalid_argument(std::string(name) + " must be an object");
       }
-      auto const &sub = attrs[name].get_unchecked<viam::sdk::ProtoStruct>();
-      for (auto const &[k, v] : sub) {
-        if (k != "width_px" and k != "height_px" and k != "fps") {
-          throw std::invalid_argument(std::string(name) +
-                                      ": unknown key \"" + k + "\"");
-        }
-      }
-      for (auto const *k : {"width_px", "height_px", "fps"}) {
-        auto it = sub.find(k);
-        if (it == sub.end()) {
-          throw std::invalid_argument(std::string(name) + "." + k +
-                                      " is required");
-        }
-        viam::sdk::ProtoValue const &pv = it->second;
-        if (not pv.is_a<double>()) {
-          throw std::invalid_argument(std::string(name) + "." + k +
-                                      " must be a number");
-        }
-        double d = pv.get_unchecked<double>();
-        if (d <= 0) {
-          throw std::invalid_argument(std::string(name) + "." + k +
-                                      " must be > 0");
-        }
-      }
-      int fps =
-          static_cast<int>(sub.at("fps").get_unchecked<double>());
-      bool ok = false;
-      for (int v : kAllowedFps) {
-        if (v == fps) {
-          ok = true;
-          break;
-        }
-      }
-      if (not ok) {
-        throw std::invalid_argument(std::string(name) +
-                                    ".fps must be one of 6, 15, 30, 60, 90");
-      }
+      validateStreamBlockParams(
+          attrs[name].get_unchecked<viam::sdk::ProtoStruct>(), name);
     };
     validateStreamBlock("depth_stream");
     validateStreamBlock("color_stream");
@@ -2134,49 +2008,32 @@ public:
     return {};
   }
 
-  // Validate that a sub-field of an optional filter block has the right
-  // numeric type and is within range. Silently returns if the block or the
-  // sub-field is absent — every field is optional within an optional block.
-  static void validateNumericRange(viam::sdk::ProtoStruct &attrs,
-                                   char const *block, char const *field,
-                                   double lo, double hi) {
-    if (not attrs.count(block)) {
-      return;
-    }
-    if (not attrs[block].is_a<viam::sdk::ProtoStruct>()) {
-      throw std::invalid_argument(std::string(block) + " must be an object");
-    }
-    viam::sdk::ProtoStruct const &sub =
-        attrs[block].get_unchecked<viam::sdk::ProtoStruct>();
+  // Validate that a numeric sub-field is within range. Silently returns when
+  // the field is absent — every field is optional within an optional block.
+  static void validateNumericRangeSub(viam::sdk::ProtoStruct const &sub,
+                                      char const *label, char const *field,
+                                      double lo, double hi) {
     auto it = sub.find(field);
     if (it == sub.end()) {
       return;
     }
     viam::sdk::ProtoValue const &v_proto = it->second;
     if (not v_proto.is_a<double>()) {
-      throw std::invalid_argument(std::string(block) + "." + field +
+      throw std::invalid_argument(std::string(label) + "." + field +
                                   " must be a number");
     }
     double v = v_proto.get_unchecked<double>();
     if (v < lo or v > hi) {
-      throw std::invalid_argument(std::string(block) + "." + field +
+      throw std::invalid_argument(std::string(label) + "." + field +
                                   " out of range");
     }
   }
 
-  // Reject unknown sub-keys in a filter block so config typos surface at
-  // load time instead of being silently ignored.
+  // Reject unknown sub-keys so typos surface loudly instead of being
+  // silently ignored.
   static void
-  validateFilterKeys(viam::sdk::ProtoStruct &attrs, char const *block,
-                     std::initializer_list<char const *> allowed) {
-    if (not attrs.count(block)) {
-      return;
-    }
-    if (not attrs[block].is_a<viam::sdk::ProtoStruct>()) {
-      return; // already reported by validateNumericRange
-    }
-    viam::sdk::ProtoStruct const &sub =
-        attrs[block].get_unchecked<viam::sdk::ProtoStruct>();
+  validateFilterKeysSub(viam::sdk::ProtoStruct const &sub, char const *label,
+                        std::initializer_list<char const *> allowed) {
     for (auto const &[k, _] : sub) {
       bool ok = false;
       for (auto const *a : allowed) {
@@ -2186,9 +2043,299 @@ public:
         }
       }
       if (not ok) {
-        throw std::invalid_argument(std::string(block) +
+        throw std::invalid_argument(std::string(label) +
                                     ": unknown key \"" + k + "\"");
       }
+    }
+  }
+
+  // Config-level wrappers: look up the block under `attrs`, delegate to the
+  // sub-struct forms above. Kept for backward compatibility with existing
+  // call sites in validate().
+  static void validateNumericRange(viam::sdk::ProtoStruct &attrs,
+                                   char const *block, char const *field,
+                                   double lo, double hi) {
+    if (not attrs.count(block)) {
+      return;
+    }
+    if (not attrs[block].is_a<viam::sdk::ProtoStruct>()) {
+      throw std::invalid_argument(std::string(block) + " must be an object");
+    }
+    validateNumericRangeSub(
+        attrs[block].get_unchecked<viam::sdk::ProtoStruct>(), block, field, lo,
+        hi);
+  }
+
+  static void
+  validateFilterKeys(viam::sdk::ProtoStruct &attrs, char const *block,
+                     std::initializer_list<char const *> allowed) {
+    if (not attrs.count(block)) {
+      return;
+    }
+    if (not attrs[block].is_a<viam::sdk::ProtoStruct>()) {
+      return; // already reported by validateNumericRange
+    }
+    validateFilterKeysSub(
+        attrs[block].get_unchecked<viam::sdk::ProtoStruct>(), block, allowed);
+  }
+
+  // Validate a filter-block payload (either config sub-struct or do_command
+  // params). Reuses the same ranges/allowed-keys as config validation.
+  // `allow_enabled` = true adds "enabled" to the allowed key set — the config
+  // format treats block presence itself as the on-switch, but do_command
+  // payloads carry an explicit "enabled" toggle.
+  static void validateFilterBlockParams(viam::sdk::ProtoStruct const &sub,
+                                        std::string const &filter_name,
+                                        bool allow_enabled) {
+    auto it_en = sub.find("enabled");
+    if (it_en != sub.end() and not it_en->second.is_a<bool>()) {
+      throw std::invalid_argument(filter_name + ".enabled must be a bool");
+    }
+    if (filter_name == "decimation_filter") {
+      validateNumericRangeSub(sub, filter_name.c_str(), "magnitude", 2, 8);
+      if (allow_enabled) {
+        validateFilterKeysSub(sub, filter_name.c_str(),
+                              {"enabled", "magnitude"});
+      } else {
+        validateFilterKeysSub(sub, filter_name.c_str(), {"magnitude"});
+      }
+    } else if (filter_name == "depth_clip_distance") {
+      validateNumericRangeSub(sub, filter_name.c_str(), "min_m", 0.0, 10.0);
+      validateNumericRangeSub(sub, filter_name.c_str(), "max_m", 0.0, 10.0);
+      if (allow_enabled) {
+        validateFilterKeysSub(sub, filter_name.c_str(),
+                              {"enabled", "min_m", "max_m"});
+      } else {
+        validateFilterKeysSub(sub, filter_name.c_str(), {"min_m", "max_m"});
+      }
+    } else if (filter_name == "spatial_filter") {
+      validateNumericRangeSub(sub, filter_name.c_str(), "magnitude", 1, 5);
+      validateNumericRangeSub(sub, filter_name.c_str(), "smooth_alpha", 0.25,
+                              1.0);
+      validateNumericRangeSub(sub, filter_name.c_str(), "smooth_delta", 1, 50);
+      validateNumericRangeSub(sub, filter_name.c_str(), "hole_fill", 0, 5);
+      if (allow_enabled) {
+        validateFilterKeysSub(
+            sub, filter_name.c_str(),
+            {"enabled", "magnitude", "smooth_alpha", "smooth_delta",
+             "hole_fill"});
+      } else {
+        validateFilterKeysSub(
+            sub, filter_name.c_str(),
+            {"magnitude", "smooth_alpha", "smooth_delta", "hole_fill"});
+      }
+    } else if (filter_name == "temporal_filter") {
+      validateNumericRangeSub(sub, filter_name.c_str(), "smooth_alpha", 0.0,
+                              1.0);
+      validateNumericRangeSub(sub, filter_name.c_str(), "smooth_delta", 1, 100);
+      validateNumericRangeSub(sub, filter_name.c_str(), "persistence", 0, 8);
+      if (allow_enabled) {
+        validateFilterKeysSub(
+            sub, filter_name.c_str(),
+            {"enabled", "smooth_alpha", "smooth_delta", "persistence"});
+      } else {
+        validateFilterKeysSub(sub, filter_name.c_str(),
+                              {"smooth_alpha", "smooth_delta", "persistence"});
+      }
+    } else if (filter_name == "hole_filling_filter") {
+      validateNumericRangeSub(sub, filter_name.c_str(), "mode", 0, 2);
+      if (allow_enabled) {
+        validateFilterKeysSub(sub, filter_name.c_str(), {"enabled", "mode"});
+      } else {
+        validateFilterKeysSub(sub, filter_name.c_str(), {"mode"});
+      }
+    } else {
+      throw std::invalid_argument("unknown filter: " + filter_name);
+    }
+  }
+
+  // Extracted from validate(). Shared by config-time and do_command paths.
+  static void validateHdrParams(viam::sdk::ProtoStruct const &sub) {
+    validateFilterKeysSub(sub, "hdr",
+                          {"enabled", "exposure_short_us", "exposure_long_us",
+                           "gain_short", "gain_long"});
+    auto it_en = sub.find("enabled");
+    if (it_en != sub.end() and not it_en->second.is_a<bool>()) {
+      throw std::invalid_argument("hdr.enabled must be a bool");
+    }
+    validateNumericRangeSub(sub, "hdr", "exposure_short_us", 1, 200000);
+    validateNumericRangeSub(sub, "hdr", "exposure_long_us", 1, 200000);
+    validateNumericRangeSub(sub, "hdr", "gain_short", 0, 248);
+    validateNumericRangeSub(sub, "hdr", "gain_long", 0, 248);
+  }
+
+  static void
+  validateAdvancedDepthControlParams(viam::sdk::ProtoStruct const &sub) {
+    validateFilterKeysSub(sub, "advanced_depth_control",
+                          {"texture_count_threshold",
+                           "texture_difference_threshold", "score_threshold_a",
+                           "score_threshold_b", "lr_agree_threshold",
+                           "median_threshold", "neighbor_threshold"});
+    for (auto const &pair : sub) {
+      viam::sdk::ProtoValue const &v_proto = pair.second;
+      if (not v_proto.is_a<double>()) {
+        throw std::invalid_argument(
+            std::string("advanced_depth_control.") + pair.first +
+            " must be a number");
+      }
+      double d = v_proto.get_unchecked<double>();
+      if (d < 0) {
+        throw std::invalid_argument(
+            std::string("advanced_depth_control.") + pair.first +
+            " must be >= 0");
+      }
+    }
+  }
+
+  static void validateDepthAeRoiParams(viam::sdk::ProtoStruct const &sub) {
+    validateFilterKeysSub(sub, "depth_ae_roi",
+                          {"min_x", "min_y", "max_x", "max_y"});
+    int min_x = 0, min_y = 0, max_x = 0, max_y = 0;
+    for (auto const &k : {"min_x", "min_y", "max_x", "max_y"}) {
+      auto it = sub.find(k);
+      if (it == sub.end()) {
+        throw std::invalid_argument(std::string("depth_ae_roi.") + k +
+                                    " is required");
+      }
+      viam::sdk::ProtoValue const &pv = it->second;
+      if (not pv.is_a<double>()) {
+        throw std::invalid_argument(std::string("depth_ae_roi.") + k +
+                                    " must be a number");
+      }
+      double d = pv.get_unchecked<double>();
+      if (d < 0) {
+        throw std::invalid_argument(std::string("depth_ae_roi.") + k +
+                                    " must be >= 0");
+      }
+      int v = static_cast<int>(d);
+      if (std::string(k) == "min_x") min_x = v;
+      else if (std::string(k) == "min_y") min_y = v;
+      else if (std::string(k) == "max_x") max_x = v;
+      else if (std::string(k) == "max_y") max_y = v;
+    }
+    if (min_x >= max_x or min_y >= max_y) {
+      throw std::invalid_argument(
+          "depth_ae_roi: min_x < max_x and min_y < max_y required");
+    }
+  }
+
+  static void validateStreamBlockParams(viam::sdk::ProtoStruct const &sub,
+                                        char const *label) {
+    static constexpr int kAllowedFps[] = {6, 15, 30, 60, 90};
+    validateFilterKeysSub(sub, label, {"width_px", "height_px", "fps"});
+    for (auto const *k : {"width_px", "height_px", "fps"}) {
+      auto it = sub.find(k);
+      if (it == sub.end()) {
+        throw std::invalid_argument(std::string(label) + "." + k +
+                                    " is required");
+      }
+      viam::sdk::ProtoValue const &pv = it->second;
+      if (not pv.is_a<double>()) {
+        throw std::invalid_argument(std::string(label) + "." + k +
+                                    " must be a number");
+      }
+      double d = pv.get_unchecked<double>();
+      if (d <= 0) {
+        throw std::invalid_argument(std::string(label) + "." + k +
+                                    " must be > 0");
+      }
+    }
+    int fps = static_cast<int>(sub.at("fps").get_unchecked<double>());
+    bool ok = false;
+    for (int v : kAllowedFps) {
+      if (v == fps) {
+        ok = true;
+        break;
+      }
+    }
+    if (not ok) {
+      throw std::invalid_argument(std::string(label) +
+                                  ".fps must be one of 6, 15, 30, 60, 90");
+    }
+  }
+
+  // do_command-only: matches the {auto, kelvin} payload shape.
+  static void
+  validateColorWhiteBalanceParams(viam::sdk::ProtoStruct const &sub) {
+    validateFilterKeysSub(sub, "set_color_white_balance", {"auto", "kelvin"});
+    auto it_a = sub.find("auto");
+    if (it_a != sub.end() and not it_a->second.is_a<bool>()) {
+      throw std::invalid_argument(
+          "set_color_white_balance.auto must be a bool");
+    }
+    auto it_k = sub.find("kelvin");
+    if (it_k != sub.end()) {
+      viam::sdk::ProtoValue const &pv = it_k->second;
+      if (not pv.is_a<double>()) {
+        throw std::invalid_argument(
+            "set_color_white_balance.kelvin must be a number");
+      }
+      double k = pv.get_unchecked<double>();
+      if (k < 2800 or k > 6500) {
+        throw std::invalid_argument(
+            "set_color_white_balance.kelvin must be in [2800, 6500]");
+      }
+    }
+  }
+
+  // Dispatch validation for do_command payloads that carry multi-field
+  // objects. Single-scalar setters are left to rs2 (see extractArg for type
+  // checks and rs2 exceptions for range).
+  static void validateDoCommandArgs(viam::sdk::ProtoStruct const &command,
+                                    DoCommand which) {
+    if (command.empty()) return;
+    auto const &kv = *command.begin();
+    auto expect_obj = [&](char const *label) -> viam::sdk::ProtoStruct const & {
+      viam::sdk::ProtoValue const &pv = kv.second;
+      if (not pv.is_a<viam::sdk::ProtoStruct>()) {
+        throw std::invalid_argument(std::string(label) + " expects an object");
+      }
+      return pv.get_unchecked<viam::sdk::ProtoStruct>();
+    };
+    switch (which) {
+    case DoCommand::SET_DECIMATION_FILTER:
+      validateFilterBlockParams(expect_obj("set_decimation_filter"),
+                                "decimation_filter", true);
+      break;
+    case DoCommand::SET_DEPTH_CLIP_DISTANCE:
+      validateFilterBlockParams(expect_obj("set_depth_clip_distance"),
+                                "depth_clip_distance", true);
+      break;
+    case DoCommand::SET_SPATIAL_FILTER:
+      validateFilterBlockParams(expect_obj("set_spatial_filter"),
+                                "spatial_filter", true);
+      break;
+    case DoCommand::SET_TEMPORAL_FILTER:
+      validateFilterBlockParams(expect_obj("set_temporal_filter"),
+                                "temporal_filter", true);
+      break;
+    case DoCommand::SET_HOLE_FILLING_FILTER:
+      validateFilterBlockParams(expect_obj("set_hole_filling_filter"),
+                                "hole_filling_filter", true);
+      break;
+    case DoCommand::SET_HDR:
+      validateHdrParams(expect_obj("set_hdr"));
+      break;
+    case DoCommand::SET_ADVANCED_DEPTH_CONTROL:
+      validateAdvancedDepthControlParams(
+          expect_obj("set_advanced_depth_control"));
+      break;
+    case DoCommand::SET_DEPTH_AE_ROI:
+      validateDepthAeRoiParams(expect_obj("set_depth_ae_roi"));
+      break;
+    case DoCommand::SET_DEPTH_STREAM:
+      validateStreamBlockParams(expect_obj("set_depth_stream"),
+                                "set_depth_stream");
+      break;
+    case DoCommand::SET_COLOR_STREAM:
+      validateStreamBlockParams(expect_obj("set_color_stream"),
+                                "set_color_stream");
+      break;
+    case DoCommand::SET_COLOR_WHITE_BALANCE:
+      validateColorWhiteBalanceParams(expect_obj("set_color_white_balance"));
+      break;
+    default:
+      break;
     }
   }
 
